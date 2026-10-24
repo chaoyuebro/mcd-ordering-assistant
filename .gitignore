@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地临时与构建产物
+tmp/
+dist/
+
+# 运行时缓存（服务会按需重新生成，不入库）
+data/product-facts.json
+
+# 凭据（token 只从环境变量读，绝不入库）
+.env
+.env.*
+*.token
+
+# Agent 工作目录：记忆不入库，skill 交付物入库
+.workbuddy/memory/
+.playwright-cli/
+
+# 系统
+.DS_Store
+Thumbs.db

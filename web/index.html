@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FFC72C">
+<title>麦当劳点餐助手</title>
+<style>
+  :root{
+    --yellow:#FFC72C; --yellow-d:#E8AF10; --red:#DA291C; --ink:#1F1F1F;
+    --muted:#6B6B6B; --line:#E8E8E8; --bg:#F5F6F7; --card:#FFFFFF;
+    --safe-b:env(safe-area-inset-bottom,0px);
+    --bar-h:62px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{
+    font:16px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--ink); background:var(--bg); overflow-x:hidden;
+    min-height:100dvh; padding-bottom:calc(var(--bar-h) + var(--safe-b));
+    -webkit-text-size-adjust:100%;
+  }
+  #app{max-width:480px;margin:0 auto;background:var(--bg);min-height:100dvh;position:relative}
+  .screen{display:none}
+  .screen.on{display:block}
+
+  /* ---------- 顶部 ---------- */
+  .top{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid var(--line);
+       padding:calc(8px + env(safe-area-inset-top,0px)) 12px 8px}
+  .top .row{display:flex;align-items:center;gap:8px;min-height:44px}
+  .store-name{flex:1;font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .link{color:var(--red);font-size:14px;min-height:44px;display:flex;align-items:center;padding:0 4px}
+  .modes{display:flex;gap:8px;margin-top:8px}
+  .mode{flex:1;min-height:44px;border:1px solid var(--line);border-radius:22px;background:#fff;
+        font-size:15px;color:var(--ink);display:flex;align-items:center;justify-content:center}
+  .mode.on{background:var(--yellow);border-color:var(--yellow);font-weight:600}
+  .search{margin-top:8px}
+  .search input{width:100%;height:44px;font-size:16px;border:1px solid var(--line);border-radius:22px;
+                padding:0 16px;background:#FAFAFA;outline:none}
+  .search input:focus{border-color:var(--yellow-d);background:#fff}
+
+  /* ---------- 选店 ---------- */
+  .pad{padding:12px}
+  .field{display:flex;gap:8px;margin-bottom:10px}
+  .field input{flex:1;height:46px;font-size:16px;border:1px solid var(--line);border-radius:12px;padding:0 14px}
+  .btn{min-height:46px;padding:0 18px;border:0;border-radius:12px;font-size:16px;font-weight:600;
+       background:var(--yellow);color:#111;display:inline-flex;align-items:center;justify-content:center}
+  .btn:active{background:var(--yellow-d)}
+  .btn.ghost{background:#fff;border:1px solid var(--line);font-weight:500}
+  .btn.block{width:100%}
+  .btn[disabled]{opacity:.5}
+  .hint{color:var(--muted);font-size:13px;margin:6px 0 10px}
+  .card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:10px;border:1px solid var(--line)}
+  .store h3{margin:0 0 4px;font-size:16px}
+  .store p{margin:0;color:var(--muted);font-size:13px}
+  .store .meta{display:flex;justify-content:space-between;align-items:center;margin-top:10px;gap:8px}
+  .tag{display:inline-block;font-size:12px;padding:2px 8px;border-radius:10px;background:#FFF4D6;color:#8A6100}
+  .tag.off{background:#F2F2F2;color:#999}
+
+  /* ---------- 菜单 ---------- */
+  .menu-wrap{display:flex;align-items:flex-start;gap:0;height:calc(100dvh - 160px - var(--safe-b));}
+  .cats{width:92px;flex:none;overflow-y:auto;background:#F0F2F4;height:100%;-webkit-overflow-scrolling:touch}
+  .cat{min-height:52px;display:flex;align-items:center;justify-content:center;text-align:center;
+       font-size:13px;color:#444;padding:8px 6px;border-left:3px solid transparent;line-height:1.25}
+  .cat.on{background:#fff;color:#111;font-weight:600;border-left-color:var(--yellow)}
+  .goods{flex:1;overflow-y:auto;height:100%;padding:8px 10px 120px;-webkit-overflow-scrolling:touch}
+  .good{display:flex;gap:10px;padding:12px 0;border-bottom:1px solid #F0F0F0}
+  .good .pic{width:76px;height:76px;flex:none;border-radius:10px;object-fit:cover;background:#EEE}
+  .good .body{flex:1;min-width:0}
+  .good h4{margin:0 0 3px;font-size:15px;font-weight:600;line-height:1.3}
+  .good .kcal{color:var(--muted);font-size:12px}
+  .macro{color:#5F5F5F;font-size:11.5px;margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:.2px}
+  .macro.none{color:#A6A6A6}
+  .good .bottom{display:flex;align-items:center;justify-content:space-between;margin-top:8px;gap:8px}
+  .price{color:var(--red);font-weight:700;font-variant-numeric:tabular-nums}
+  .add{min-width:44px;min-height:44px;padding:0 14px;border:0;border-radius:22px;background:var(--yellow);
+       font-size:15px;font-weight:700;color:#111}
+  .add[disabled]{background:#EDEDED;color:#AAA}
+  .src{font-size:11px;color:#9A9A9A;margin-left:4px}
+
+  /* ---------- 底部购物车 ---------- */
+  .cartbar{position:fixed;left:0;right:0;bottom:0;z-index:30;background:#222;color:#fff;
+           padding:10px 12px calc(10px + var(--safe-b));display:none}
+  .cartbar.on{display:block}
+  /* 抽屉打开时彻底隐藏页面底栏，避免两条底栏重叠 */
+  body.sheet-open #cart-bar{display:none !important}
+  .cartbar .inner{max-width:480px;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .cartbar .sum{flex:1;min-width:0}
+  .cartbar .sum b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+  .cartbar .sum span{font-size:12px;opacity:.75}
+  .cartbar .go{min-height:46px;padding:0 20px;border-radius:23px;background:var(--yellow);color:#111;
+                font-weight:700;border:0;font-size:16px}
+  .cartbar .go[disabled]{opacity:.55}
+
+  /* ---------- 抽屉 / 确认页 ---------- */
+  .sheet{position:fixed;inset:0;z-index:40;display:none;background:rgba(0,0,0,.35)}
+  .sheet.on{display:block}
+  .sheet .panel{position:absolute;left:0;right:0;bottom:0;max-height:86dvh;overflow-y:auto;
+    background:#fff;border-radius:18px 18px 0 0;padding:14px 14px calc(96px + var(--safe-b));
+    max-width:480px;margin:0 auto}
+  .sheet h3{margin:2px 0 10px;font-size:17px}
+  .cart-line{display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-bottom:1px solid #F2F2F2}
+  .cart-line .n{flex:1;min-width:0}
+  .cart-line .n b{font-size:15px;font-weight:600}
+  .cart-line .n small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+  .cart-line .n small.pline{color:var(--red);font-size:14px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
+  .cart-line .n small.pline b{font-weight:700}
+  .stepper{display:flex;align-items:center;gap:2px}
+  .stepper button{width:44px;height:44px;border-radius:22px;border:1px solid var(--line);background:#fff;font-size:18px}
+  .stepper span{min-width:26px;text-align:center;font-variant-numeric:tabular-nums}
+  .opt{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 0;border-bottom:1px solid #F2F2F2}
+  .opt .k{font-size:15px}
+  .opt .k small{display:block;color:var(--muted);font-size:12px}
+  .seg{display:flex;gap:8px}
+  .seg button{min-height:44px;min-width:64px;border-radius:22px;border:1px solid var(--line);background:#fff;font-size:15px}
+  .seg button.on{background:var(--yellow);border-color:var(--yellow);font-weight:600}
+  .sumline{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:#444;font-variant-numeric:tabular-nums}
+  .sumline.total{font-size:17px;font-weight:700;color:var(--ink);padding-top:10px}
+  .sumline .r{color:var(--red)}
+  .sheet .foot{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);
+    padding:10px 14px calc(10px + var(--safe-b));max-width:480px;margin:0 auto;display:flex;gap:10px;align-items:center}
+  .banner{background:#FFF7E0;color:#7A5B00;font-size:13px;border-radius:10px;padding:10px;margin:10px 0}
+  .banner.err{background:#FDECEA;color:#9B1C15}
+  .empty{text-align:center;color:var(--muted);padding:36px 12px;font-size:14px}
+  .skel{height:76px;border-radius:10px;background:linear-gradient(90deg,#EFEFEF,#F7F7F7,#EFEFEF);margin:10px 0;
+        animation:sh 1.2s infinite}
+  @keyframes sh{0%{opacity:.6}50%{opacity:1}100%{opacity:.6}}
+  .fine{color:#9A9A9A;font-size:11px;line-height:1.5}
+
+  /* ---------- 智能配餐 ---------- */
+  .mode.entry{flex:0 0 96px;font-size:14px;background:#FFF4D6;border-color:#F0D480;font-weight:600;color:#8A6100}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 2px}
+  .chip{min-height:34px;padding:0 12px;border-radius:17px;border:1px solid var(--line);background:#FAFAFA;
+        font-size:13px;color:#444;display:inline-flex;align-items:center}
+  .chip:active{background:#F0F0F0}
+  .cond{margin:12px 0 4px;padding:10px 12px;background:#FAFAFA;border:1px solid var(--line);border-radius:12px}
+  .cond .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+  .cond .head b{font-size:13px;font-weight:600}
+  .cond .head .link{min-height:auto;font-size:13px}
+  .cond .tags{display:flex;flex-wrap:wrap;gap:6px}
+  .cond .tag{background:#EAF3FF;color:#1A4E8A}
+  .cond .tag.must{background:#FFF0E6;color:#8A3D00}
+  .cond .tag.pref{background:#EAF7EC;color:#1D6B2C}
+  .cond .tag.macro{background:#F1ECFF;color:#4B2A8A}
+  .cond .locked{margin-top:8px;font-size:12px;color:#444;background:#FFF7E0;border-radius:8px;padding:8px 10px}
+  .cond .locked .sum{font-weight:600}
+  .cond .locked .row{display:flex;justify-content:space-between;gap:8px;margin-top:4px;color:#6A5A2E;font-size:12px}
+  .cond .locked .est{color:#9A6A00;font-size:11px;margin-left:2px}
+  .cond .locked .hint{margin-top:6px;font-size:11px;color:#8A6100;line-height:1.5}
+  .plan-card{border:1px solid var(--line);border-radius:14px;padding:12px;margin:10px 0;background:#fff}
+  .plan-card .ph{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px}
+  .plan-card .ph b{font-size:14px;color:#8A6100;background:#FFF4D6;border-radius:8px;padding:2px 8px;font-weight:600}
+  .plan-card .ph .amt{font-size:19px;font-weight:700;color:var(--red);font-variant-numeric:tabular-nums}
+  .plan-card .items{font-size:14px;line-height:1.7}
+  .plan-card .items .q{color:var(--muted);font-size:13px}
+  .plan-card .meta{margin-top:6px;font-size:13px;color:#444;font-variant-numeric:tabular-nums}
+  .plan-card .meta .k{color:var(--muted)}
+  .plan-card .why{margin-top:6px;font-size:12px;color:#5A5A5A}
+  .plan-card .acts{display:flex;gap:8px;margin-top:10px}
+  .plan-card .acts .btn{flex:1;min-height:42px;font-size:15px}
+  .plan-card .acts .btn.ghost{flex:0 0 96px}
+  .warn{background:#FFF7E0;color:#7A5B00;font-size:12px;border-radius:10px;padding:9px 10px;margin:8px 0;line-height:1.5}
+  .warn.err{background:#FDECEA;color:#9B1C15}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- 选店 -->
+  <section class="screen on" id="screen-store">
+    <div class="top">
+      <div class="row"><div class="store-name">选择门店</div><span class="tag" id="conn-tag">检查中</span></div>
+      <div class="search">
+        <input id="city" placeholder="城市，如：郑州" value="郑州" autocomplete="off">
+      </div>
+      <div class="search">
+        <input id="keyword" placeholder="位置关键词，如：二七广场" autocomplete="off">
+      </div>
+      <div class="modes" style="margin-top:8px">
+        <button class="btn ghost" id="btn-locate">使用当前地址</button>
+        <button class="btn block" id="btn-search" style="flex:1">搜索门店</button>
+      </div>
+    </div>
+    <div class="pad" id="store-list"><p class="hint">输入城市与位置关键词后搜索；也可在麦当劳 App 收藏门店后直接查询。</p></div>
+  </section>
+
+  <!-- 菜单 -->
+  <section class="screen" id="screen-menu">
+    <div class="top">
+      <div class="row">
+        <div class="store-name" id="m-store">门店</div>
+        <span class="link" id="btn-switch-store">切换</span>
+      </div>
+      <div class="modes">
+        <button class="mode on" data-mode="normal">普通</button>
+        <button class="mode" data-mode="lean">减脂</button>
+        <button class="mode entry" id="btn-plan">智能配餐</button>
+      </div>
+      <div class="search"><input id="q" placeholder="搜索餐品名称" autocomplete="off"></div>
+    </div>
+    <div class="menu-wrap">
+      <nav class="cats" id="cats"></nav>
+      <main class="goods" id="goods"></main>
+    </div>
+    <div class="cartbar" id="cart-bar">
+      <div class="inner">
+        <div class="sum"><b id="bar-kcal">约 0 千卡</b><span id="bar-count">0 件</span></div>
+        <button class="go" id="bar-go" disabled>去结算</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 购物车抽屉 -->
+<div class="sheet" id="cart-sheet">
+  <div class="panel">
+    <h3>购物车</h3>
+    <div id="cart-lines"></div>
+    <div id="cart-sum" style="margin-top:12px"></div>
+    <div class="banner" id="price-note" style="display:none"></div>
+  </div>
+  <div class="foot">
+    <div style="flex:1">
+      <div style="font-size:12px;color:#6B6B6B" id="cart-count">0 件</div>
+      <div class="price" id="cart-total">试算中…</div>
+    </div>
+    <button class="btn" id="btn-confirm">去确认</button>
+  </div>
+</div>
+
+<!-- 确认页 -->
+<div class="sheet" id="confirm-sheet">
+  <div class="panel">
+    <h3>确认订单</h3>
+    <div id="confirm-body"></div>
+  </div>
+  <div class="foot">
+    <button class="btn ghost" id="btn-back-cart">返回</button>
+    <button class="btn" id="btn-create" style="flex:1">确认并创建订单</button>
+  </div>
+</div>
+
+<!-- 智能配餐抽屉 -->
+<div class="sheet" id="plan-sheet">
+  <div class="panel">
+    <h3>智能配餐 <span class="tag" id="plan-mode">普通模式</span></h3>
+    <div class="search">
+      <input id="plan-text" placeholder="说说你想吃什么，如：不超过1000千卡，要一个汉堡一杯咖啡" autocomplete="off">
+    </div>
+    <div class="chips" id="plan-chips">
+      <button class="chip" data-fill="不超过1000千卡">≤1000千卡</button>
+      <button class="chip" data-fill="预算40元以内">预算40元</button>
+      <button class="chip" data-fill="一个汉堡一杯咖啡">汉堡+咖啡</button>
+      <button class="chip" data-fill="蛋白质25g以上">高蛋白</button>
+      <button class="chip" data-fill="脂肪15g以内">低脂</button>
+      <button class="chip" data-fill="碳水40g以内">低碳水</button>
+      <button class="chip" data-fill="便宜点">更便宜</button>
+      <button class="chip" data-fill="要吃饱">吃饱</button>
+    </div>
+    <div id="plan-cond"></div>
+    <div id="plan-list"></div>
+    <div id="plan-note"></div>
+  </div>
+  <div class="foot">
+    <button class="btn block" id="btn-plan-run">生成方案</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const state = {
+    store: null, mode: 'normal', menu: null, cart: [], takeWay: null,
+    price: null, activeCat: null, conn: 'unknown'
+  };
+  const $ = (s) => document.querySelector(s);
+  const store = {
+    save() {
+      localStorage.setItem('mcd.cart', JSON.stringify({
+        store: state.store, mode: state.mode, cart: state.cart, takeWay: state.takeWay
+      }));
+    },
+    load() {
+      try {
+        const raw = JSON.parse(localStorage.getItem('mcd.cart') || 'null');
+        if (raw && raw.store) { state.store = raw.store; state.mode = raw.mode || 'normal';
+          state.cart = (raw.cart || []).map(i => ({
+            ...i,
+            baseKcal: i.baseKcal != null ? i.baseKcal : (i.kcalUnit || 0),
+            sauceOff: !!i.sauceOff,
+            sauceAvailable: !!i.sauceAvailable,
+            fixedSauce: !!i.fixedSauce
+          }));
+          state.takeWay = raw.takeWay || null; return true; }
+      } catch (e) {}
+      return false;
+    }
+  };
+
+  async function api(path, opts) {
+    const res = await fetch(path, opts);
+    const data = await res.json().catch(() => ({ ok: false, message: '返回不是 JSON' }));
+    if (!res.ok || data.ok === false) {
+      const err = new Error(data.message || ('HTTP ' + res.status));
+      err.state = data.state || (res.status === 401 ? '连接失效' : '查询失败');
+      throw err;
+    }
+    return data;
+  }
+
+  function show(id) {
+    document.querySelectorAll('.screen').forEach(el => el.classList.toggle('on', el.id === id));
+    if (id !== 'screen-menu') $('#cart-bar').classList.remove('on');
+    else renderCartBar();
+  }
+  function yuan(fen) { return '¥' + ((fen || 0) / 100).toFixed(2); }
+  function kcalText(k) { return '约 ' + Math.round(k || 0) + ' 千卡'; }
+  function fmtG(v) { return String(Math.round((Number(v) || 0) * 10) / 10); }
+  // 三大营养素只显示官方同名数据。缺数据时不再留白——留给用户一句「没有」，
+  // 否则会像渲染坏了（实测用户看到「高达吉士双牛堡」没有这一行就是这么反馈的）。
+  function macroLine(m) {
+    if (!m) return '<div class="macro none">营养素暂无官方数据</div>';
+    return `<div class="macro">蛋白 ${fmtG(m.protein)}g · 脂肪 ${fmtG(m.fat)}g · 碳水 ${fmtG(m.carbohydrate)}g</div>`;
+  }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  async function health() {
+    try {
+      const d = await api('/api/health');
+      state.conn = d.hasToken ? '已连接' : '未配置凭据';
+      $('#conn-tag').textContent = state.conn;
+      $('#conn-tag').className = 'tag' + (d.hasToken ? '' : ' off');
+    } catch (e) { $('#conn-tag').textContent = e.state || '查询失败'; }
+  }
+
+  function renderStores(list, prefix) {
+    const box = $('#store-list');
+    if (!list || !list.length) {
+      box.innerHTML = (prefix || '') + '<p class="hint">没有查到门店，换个关键词试试。</p>';
+      return;
+    }
+    box.innerHTML = (prefix || '') + list.map(s => `
+      <div class="card store">
+        <h3>${esc(s.storeName)}</h3>
+        <p>${esc(s.address || '')}${s.distance != null ? ' · 约 ' + s.distance + 'm' : ''}</p>
+        <div class="meta">
+          <span class="tag ${s.businessStatus ? '' : 'off'}">${s.businessStatus ? '营业中' : '暂停营业'}</span>
+          <button class="btn" data-store="${esc(s.storeCode)}" ${s.businessStatus ? '' : 'disabled'}>选这家</button>
+        </div>
+      </div>`).join('');
+    box.querySelectorAll('button[data-store]').forEach(btn => {
+      btn.onclick = () => {
+        const s = list.find(x => x.storeCode === btn.dataset.store);
+        state.store = s; state.cart = []; state.price = null; state.takeWay = null;
+        store.save(); openMenu();
+      };
+    });
+  }
+
+  async function searchStores() {
+    const city = $('#city').value.trim(), kw = $('#keyword').value.trim();
+    $('#store-list').innerHTML = '<div class="skel"></div><div class="skel"></div>';
+    try {
+      const d = await api('/api/stores?city=' + encodeURIComponent(city) + '&keyword=' + encodeURIComponent(kw));
+      renderStores(d.stores, city ? `<div class="hint">${esc(city + (kw ? ' · ' + kw : ''))} 附近的门店</div>` : '');
+    } catch (e) {
+      $('#store-list').innerHTML = `<div class="banner err">${esc(e.state || '查询失败')}：${esc(e.message)}</div>`;
+    }
+  }
+
+  async function locate() {
+    const box = $('#store-list');
+    if (!navigator.geolocation) {
+      box.innerHTML = '<div class="banner err">当前浏览器不支持定位，请手动输入城市与关键词。</div>';
+      return;
+    }
+    if (!window.isSecureContext) {
+      box.innerHTML = '<div class="banner err">浏览器只在 HTTPS 或 localhost 下允许定位。用局域网 IP 打开时请手动输入，或改用 HTTPS 访问。</div>';
+      return;
+    }
+    box.innerHTML = '<div class="banner">正在获取当前位置…</div>';
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      try {
+        const d = await api('/api/locate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lat: pos.coords.latitude, lng: pos.coords.longitude })
+        });
+        if (d.city) $('#city').value = d.city;
+        if (d.keyword) $('#keyword').value = d.keyword;
+        const extra = d.fallback === 'favorites' ? '，该区域未查到结果，已回退到收藏门店' : '';
+        const level = d.provider === 'photon' ? '街道/小区级' : (d.provider === 'bigdatacloud' ? '区县级' : '');
+        renderStores(d.stores, `<div class="hint">定位到：${esc(d.label || '')}${level ? '（' + level + '）' : ''}（按「${esc(d.keyword || d.city || '')}」查询${extra}）</div>`);
+      } catch (e) {
+        box.innerHTML = `<div class="banner err">${esc(e.message || '定位失败')}</div>`;
+      }
+    }, (err) => {
+      const map = { 1: '已拒绝定位权限，可手动输入城市与关键词', 2: '无法获取位置（信号不可用）', 3: '定位超时，请重试或手动输入' };
+      box.innerHTML = `<div class="banner err">${map[err.code] || '定位失败'}</div>`;
+    }, { timeout: 10000, maximumAge: 60000, enableHighAccuracy: false });
+  }
+
+  async function openMenu() {
+    show('screen-menu');
+    $('#m-store').textContent = state.store.storeName;
+    document.querySelectorAll('.mode[data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === state.mode));
+    await loadMenu();
+  }
+
+  async function loadMenu() {
+    $('#cats').innerHTML = ''; $('#goods').innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+    try {
+      const d = await api(`/api/menu?storeCode=${encodeURIComponent(state.store.storeCode)}&mode=${state.mode}`);
+      state.menu = d;
+      // 后端在减脂模式已按商品实际类别归位分类（“饮品”下的黑咖啡会并入咖啡分类），
+      // 前端不要再按 kind 过滤，否则整类咖啡会被隐藏。
+      const cats = d.categories.filter(c => (c.codes || []).length);
+      state.activeCat = cats.length ? cats[0].name : null;
+      $('#cats').innerHTML = cats.map(c =>
+        `<div class="cat ${c.name === state.activeCat ? 'on' : ''}" data-cat="${esc(c.name)}">${esc(c.name.replace(/\n/g, ''))}</div>`
+      ).join('');
+      $('#cats').querySelectorAll('.cat').forEach(el => {
+        el.onclick = () => { state.activeCat = el.dataset.cat;
+          document.querySelectorAll('.cat').forEach(x => x.classList.toggle('on', x === el));
+          renderGoods(); };
+      });
+      renderGoods(); renderCartBar();
+    } catch (e) {
+      $('#goods').innerHTML = `<div class="banner err">${esc(e.state || '查询失败')}：${esc(e.message)}<br>请下拉重试或切换门店</div>`;
+    }
+  }
+
+  function renderGoods() {
+    const d = state.menu; if (!d) return;
+    const q = ($('#q').value || '').trim();
+    let items = d.items;
+    if (q) items = items.filter(i => i.name.includes(q));
+    else {
+      // 按分类的 codes 取商品，而不是按商品自带的原始分类名：减脂模式会把
+      // “饮品”下的黑咖啡归位到咖啡分类，原始分类名对不上会漏商品。
+      const cat = (d.categories || []).find(c => c.name === state.activeCat);
+      const codes = new Set(cat ? cat.codes : []);
+      items = items.filter(i => codes.has(i.code));
+    }
+    if (!items.length) { $('#goods').innerHTML = '<div class="empty">这个分类下暂时没有可选餐品</div>'; return; }
+    $('#goods').innerHTML = items.map(i => {
+      const blocked = i.decision && i.decision.allowed === false;
+      const reason = i.decision && i.decision.reason ? i.decision.reason : '';
+      return `<div class="good">
+        ${i.image ? `<img class="pic" src="${esc(i.image)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">` : '<div class="pic"></div>'}
+        <div class="body">
+          <h4>${esc(i.name)}</h4>
+          <div class="kcal">${esc(i.kcal.display)}<span class="src">${i.autoSauceRemoved ? '已去酱 · ' : ''}${i.kcal.source === 'official' ? '官方' : '估算'}</span></div>
+          ${macroLine(i.macros)}
+          ${blocked ? `<div class="fine">${esc(reason)}</div>` : ''}
+          <div class="bottom">
+            <span class="price">${i.price ? '¥' + esc(i.price) : '—'}</span>
+            <button class="add" data-code="${esc(i.code)}" ${blocked ? 'disabled' : ''}>${blocked ? '不可选' : '加入'}</button>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    $('#goods').querySelectorAll('button.add').forEach(btn => {
+      btn.onclick = () => addToCart(btn.dataset.code);
+    });
+  }
+
+  function sauceKcalOf() {
+    return (state.menu && state.menu.estimateParams && state.menu.estimateParams.sauce_kcal_per_serving) || 0;
+  }
+
+  function unitKcalOf(it) {
+    return Math.max(0, (it.baseKcal || 0) - (it.sauceOff ? sauceKcalOf() : 0));
+  }
+
+  async function addToCart(code) {
+    const item = state.menu.items.find(x => x.code === code);
+    if (!item) return;
+    const exist = state.cart.find(x => x.code === code);
+    if (exist) {
+      exist.quantity += 1;
+    } else {
+      const isLeanBurger = state.mode === 'lean' && item.decision.kind === 'burger';
+      const sauceOff = isLeanBurger && item.hasSauces;
+      const base = (item.kcal.unit || 0) + (item.autoSauceRemoved ? sauceKcalOf() : 0);
+      state.cart.push({
+        code, name: item.name, price: item.price, kind: item.decision.kind,
+        baseKcal: base, sauceOff, sauceAvailable: state.mode === 'lean' ? !!item.hasSauces : null,
+        fixedSauce: isLeanBurger && !!item.hasSauces,
+        macros: item.macros || null,
+        quantity: 1, creamerUnits: 0
+      });
+    }
+    store.save(); renderCartBar(); await refreshPrice();
+  }
+
+  function cartCount() { return state.cart.reduce((s, i) => s + i.quantity, 0); }
+  function cartKcal() { return state.cart.reduce((s, i) => s + unitKcalOf(i) * i.quantity, 0); }
+  // 整餐三大营养素：只累加有官方数据的商品，覆盖不足时如实告知件数
+  function cartMacros() {
+    const sum = { protein: 0, fat: 0, carbohydrate: 0 };
+    let covered = 0, units = 0;
+    state.cart.forEach(i => {
+      units += i.quantity;
+      const m = i.macros;
+      if (!m) return;
+      covered += i.quantity;
+      sum.protein += m.protein * i.quantity;
+      sum.fat += m.fat * i.quantity;
+      sum.carbohydrate += m.carbohydrate * i.quantity;
+    });
+    return { sum, covered, units };
+  }
+  function unitPriceOf(it) { return Number(it.price) || 0; }
+  function cartSubtotal() { return state.cart.reduce((s, i) => s + unitPriceOf(i) * i.quantity, 0); }
+  function money(n) { return '¥' + (Number(n) || 0).toFixed(2); }
+
+  function renderCartBar() {
+    const n = cartCount();
+    const sheetOpen = $('#cart-sheet').classList.contains('on') || $('#confirm-sheet').classList.contains('on');
+    // 抽屉打开时隐藏页面底部购物车条，避免两条底栏叠在一起
+    $('#cart-bar').classList.toggle('on', n > 0 && !sheetOpen);
+    $('#bar-kcal').textContent = kcalText(cartKcal());
+    $('#bar-count').textContent = n + ' 件 · ' + (state.price ? '应付 ' + yuan(state.price.cents) : '试算中…');
+    $('#bar-go').disabled = !state.price;
+    // 抽屉里的底部同步同一份数字（不重复展示热量，热量在上方汇总区）
+    $('#cart-count').textContent = n + ' 件';
+    $('#cart-total').textContent = state.price ? '应付 ' + yuan(state.price.cents) : '试算中…';
+  }
+
+  let priceSeq = 0; // 试算请求序号：只接受最新一次结果，避免旧响应覆盖新购物车
+
+  async function refreshPrice() {
+    if (!state.cart.length) { state.price = null; renderCartBar(); return; }
+    const seq = ++priceSeq;
+    try {
+      const data = await api('/api/price', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storeCode: state.store.storeCode, needTableware: true,
+          items: state.cart.map(i => ({
+            code: i.code, quantity: i.quantity,
+            removeSauces: !!i.sauceOff
+          }))
+        })
+      });
+      if (seq !== priceSeq) return; // 过期响应直接丢弃
+      state.price = data;
+      $('#price-note').style.display = data.couponError ? 'block' : 'none';
+      $('#price-note').className = 'banner';
+      $('#price-note').textContent = data.couponError ? '优惠暂未确认：' + data.couponError : '';
+    } catch (e) {
+      if (seq !== priceSeq) return;
+      state.price = null;
+      $('#price-note').style.display = 'block';
+      $('#price-note').className = 'banner err';
+      $('#price-note').textContent = (e.state || '试算失败') + '：' + e.message;
+    }
+    renderCartBar();
+    if ($('#cart-sheet').classList.contains('on')) renderCartSummary();
+  }
+
+  function renderCartSummary() {
+    const sub = cartSubtotal();
+    const payable = state.price ? (state.price.cents || 0) / 100 : null;
+    // 无优惠时“商品小计”与“应付”是同一个数，只显示一次
+    const showSubtotal = payable === null || Math.abs(payable - sub) > 0.005;
+    const mac = cartMacros();
+    $('#cart-sum').innerHTML = `
+      ${showSubtotal ? `<div class="sumline"><span>商品小计</span><span>${money(sub)}</span></div>` : ''}
+      <div class="sumline"><span>整餐估算</span><span>${kcalText(cartKcal())}</span></div>
+      ${mac.covered ? `<div class="sumline"><span>蛋白 / 脂肪 / 碳水</span><span>${fmtG(mac.sum.protein)} / ${fmtG(mac.sum.fat)} / ${fmtG(mac.sum.carbohydrate)} g</span></div>` : ''}
+      ${mac.covered && mac.covered < mac.units ? `<div class="fine">营养素只计有官方数据的 ${mac.covered}/${mac.units} 件</div>` : ''}`;
+  }
+
+  function openCart() {
+    const lines = state.cart.map((i, idx) => `
+      <div class="cart-line">
+        <div class="n">
+          <b>${esc(i.name)}</b>
+          <small class="pline">${i.quantity > 1
+            ? `${money(unitPriceOf(i))} × ${i.quantity} = <b>${money(unitPriceOf(i) * i.quantity)}</b>`
+            : money(unitPriceOf(i))}</small>
+          <small>${kcalText(unitKcalOf(i) * i.quantity)}${i.sauceOff ? ' · 已去酱' : ''}</small>
+          ${i.macros ? `<small class="macro">蛋白 ${fmtG(i.macros.protein)}g · 脂肪 ${fmtG(i.macros.fat)}g · 碳水 ${fmtG(i.macros.carbohydrate)}g${i.quantity > 1 ? ` ×${i.quantity}` : ''}</small>` : ''}
+          ${i.fixedSauce
+            ? '<div class="fine">已去酱 · 减脂模式固定要求，不可取消</div>'
+            : ((i.sauceAvailable !== false && i.kind === 'burger')
+              ? `<button class="btn ghost" style="min-height:36px;padding:0 12px;font-size:13px;margin-top:6px" data-sauce="${idx}">${i.sauceOff ? '恢复加酱' : '去酱'}</button>`
+              : '')}
+        </div>
+        <div class="stepper">
+          <button data-minus="${idx}">−</button><span>${i.quantity}</span><button data-plus="${idx}">＋</button>
+        </div>
+      </div>`).join('');
+    $('#cart-lines').innerHTML = lines || '<div class="empty">购物车是空的</div>';
+    renderCartSummary();
+    $('#cart-lines').querySelectorAll('[data-plus]').forEach(b => b.onclick = () => qty(+b.dataset.plus, 1));
+    $('#cart-lines').querySelectorAll('[data-minus]').forEach(b => b.onclick = () => qty(+b.dataset.minus, -1));
+    $('#cart-lines').querySelectorAll('[data-sauce]').forEach(b => b.onclick = () => toggleSauce(+b.dataset.sauce));
+    $('#cart-sheet').classList.add('on');
+    document.body.classList.add('sheet-open');
+    renderCartBar();
+  }
+
+  function qty(idx, delta) {
+    const it = state.cart[idx]; if (!it) return;
+    it.quantity += delta;
+    if (it.quantity <= 0) state.cart.splice(idx, 1);
+    store.save(); openCart(); renderCartBar(); refreshPrice();
+  }
+
+  async function toggleSauce(idx) {
+    const it = state.cart[idx];
+    if (!it) return;
+    if (it.fixedSauce) { alert('减脂模式下汉堡必须去酱，不能取消'); return; }
+    if (it.sauceAvailable == null) {
+      // 普通模式没有预取详情，首次点击时确认该商品是否有可取消的酱料
+      try {
+        const d = await api(`/api/detail?storeCode=${encodeURIComponent(state.store.storeCode)}&code=${encodeURIComponent(it.code)}`);
+        const has = (d.options || []).some(o => (o.name || '').includes('酱') && o.unselectedKey);
+        it.sauceAvailable = has;
+        if (!has) { alert('该商品没有可取消的酱料选项'); openCart(); return; }
+      } catch (e) {
+        alert((e.state || '查询失败') + '：' + e.message);
+        return;
+      }
+    }
+    it.sauceOff = !it.sauceOff;
+    store.save(); openCart(); renderCartBar(); refreshPrice();
+  }
+
+  function openConfirm() {
+    // 先关掉购物车抽屉，避免两个抽屉的底部栏叠在一起
+    $('#cart-sheet').classList.remove('on');
+    const ways = (state.price && state.price.takeWayList) || [];
+    if (ways.length && !state.takeWay) state.takeWay = ways[ways.length - 1][0]; // 默认外带
+    const p = state.price;
+    $('#confirm-body').innerHTML = `
+      <div class="opt"><div class="k">门店<small>${esc(state.store.storeName)}</small></div></div>
+      <div class="opt"><div class="k">取餐方式<small>到店自取</small></div>
+        <div class="seg">${ways.map(([code, title]) => `<button data-way="${esc(code)}" class="${state.takeWay === code ? 'on' : ''}">${esc(title)}</button>`).join('')}</div>
+      </div>
+      <div class="opt"><div class="k">餐具<small>默认需要，按官方餐具费计入</small></div>
+        <div class="seg"><button class="on" data-tw="1">需要</button><button data-tw="0">不需要</button></div>
+      </div>
+      <div class="opt"><div class="k">餐品<small>${state.cart.map(i => esc(i.name) + ' ×' + i.quantity).join('、')}</small></div></div>
+      <div class="opt"><div class="k">整餐热量<small>${kcalText(cartKcal())}</small></div></div>
+      ${p ? `
+        <div class="sumline"><span>商品金额</span><span>${yuan(p.breakdown.product)}</span></div>
+        <div class="sumline"><span>打包 / 餐具</span><span>${yuan((p.breakdown.packing || 0) + (p.breakdown.tableware || 0))}</span></div>
+        <div class="sumline"><span>优惠${p.coupon ? '（' + esc(p.coupon) + '）' : ''}</span><span class="r">-${yuan(p.breakdown.discount)}</span></div>
+        <div class="sumline total"><span>应付</span><span class="r">${yuan(p.cents)}</span></div>
+        <div class="fine">${esc(p.note || '')}</div>` : '<div class="banner">尚未完成试算</div>'}
+      <div class="banner">下单接口本版未接入：涉及真实订单与支付，需你确认后才开启。</div>`;
+    $('#confirm-body').querySelectorAll('[data-way]').forEach(b => b.onclick = () => {
+      state.takeWay = b.dataset.way;
+      $('#confirm-body').querySelectorAll('[data-way]').forEach(x => x.classList.toggle('on', x === b));
+      store.save();
+    });
+    $('#confirm-sheet').classList.add('on');
+    document.body.classList.add('sheet-open');
+    renderCartBar();
+  }
+
+  // ---------- 智能配餐（PRD US-03） ----------
+  const planState = { seq: 0, skip: [], last: null, applying: false };
+  const TAG_CLASS = { must: 'must', exclude: '', pref: 'pref', macro: 'macro' };
+
+  function openPlan() {
+    $('#plan-mode').textContent = state.mode === 'lean' ? '减脂模式' : '普通模式';
+    $('#plan-sheet').classList.add('on');
+    document.body.classList.add('sheet-open');
+    planState.skip = [];
+    if (!planState.last) $('#plan-cond').innerHTML = '';
+    setTimeout(() => { const el = $('#plan-text'); if (el) el.focus(); }, 120);
+  }
+
+  function closePlan() {
+    $('#plan-sheet').classList.remove('on');
+    document.body.classList.remove('sheet-open');
+    renderCartBar();
+  }
+
+  function renderCond(d) {
+    const rec = d.recognized || [];
+    const cart = d.cartItems || [];
+    const tags = rec
+      .map(r => `<span class="tag ${TAG_CLASS[r.type] || ''}">${esc(r.label)}</span>`)
+      .join('');
+    // 配餐口径：价格与热量只算方案自身，不与购物车相加，所以这里只提示不重复推荐，不报数字
+    const lockInfo = cart.length
+      ? `<div class="locked">购物车已有 ${cart.reduce((s, i) => s + i.quantity, 0)} 件：${cart.map(i => esc(i.name) + '×' + i.quantity).join('、')}。配餐按独立一份计算，不会重复推荐</div>`
+      : '';
+    $('#plan-cond').innerHTML = `
+      <div class="cond">
+        <div class="head"><b>已识别条件</b><span class="link" id="plan-edit">修改</span></div>
+        <div class="tags">${tags || '<span class="fine">没识别到条件，将按当前模式的常规搭配生成</span>'}</div>
+        ${lockInfo}
+      </div>`;
+    const edit = $('#plan-edit');
+    if (edit) edit.onclick = () => { const el = $('#plan-text'); el.focus(); el.select(); };
+  }
+
+  function renderPlans(d) {
+    const list = d.plans || [];
+    if (!list.length) {
+      $('#plan-list').innerHTML = '';
+      const b = d.blocker || {};
+      const sug = (b.suggestions || []).map(s => `<div class="fine">· ${esc(s)}</div>`).join('');
+      $('#plan-note').innerHTML =
+        `<div class="warn err">${esc(b.message || '没有找到符合条件的方案')}</div>${sug}` +
+        (d.note ? `<div class="warn">${esc(d.note)}</div>` : '');
+      return;
+    }
+    $('#plan-list').innerHTML = list.map((p, idx) => {
+      const items = (p.items || []).map(it =>
+        `<div>${esc(it.name)} <span class="q">×${it.quantity}${it.sauceOff ? ' · 已去酱' : ''}</span></div>`
+      ).join('');
+      return `<div class="plan-card">
+        <div class="ph"><b>方案 ${p.id}</b><span class="amt">${money(p.yuan)}</span></div>
+        <div class="items">${items}</div>
+        <div class="meta"><span class="k">本方案</span> ${esc(p.kcalText)}${p.hasEstimate ? '（含估算项）' : ''}${p.coupon ? ' · 已用券 ' + esc(p.coupon) : ''}</div>
+        ${p.macrosText ? `<div class="macro">${esc(p.macrosText)}${p.macrosIncomplete ? '　部分商品无官方数据，故为下限' : ''}</div>` : ''}
+        <div class="why">${esc(p.reason)}</div>
+        <div class="acts">
+          <button class="btn ghost" data-swap="${idx}">换一套</button>
+          <button class="btn" data-apply="${idx}">选择此方案</button>
+        </div>
+      </div>`;
+    }).join('');
+    $('#plan-note').innerHTML = d.note ? `<div class="warn">${esc(d.note)}</div>` : '';
+
+    $('#plan-list').querySelectorAll('[data-apply]').forEach(b => {
+      b.onclick = () => applyPlan(list[+b.dataset.apply]);
+    });
+    $('#plan-list').querySelectorAll('[data-swap]').forEach(b => {
+      b.onclick = () => {
+        // 换一套：把当前展示过的方案都排除，再要一组新的
+        planState.skip = list.map(p => p.signature).filter(Boolean);
+        runPlan(true);
+      };
+    });
+  }
+
+  async function runPlan(isSwap) {
+    const text = ($('#plan-text').value || '').trim();
+    if (!text) { alert('先说一句你想吃什么，比如「不超过1000千卡，要一个汉堡一杯咖啡」'); return; }
+    const seq = ++planState.seq;
+    const btn = $('#btn-plan-run');
+    btn.disabled = true;
+    btn.textContent = '生成中…';
+    $('#plan-note').innerHTML = '<div class="warn">正在按当前门店菜单搭配并试算价格…</div>';
+    try {
+      const d = await api('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storeCode: state.store.storeCode,
+          mode: state.mode,
+          text,
+          cart: state.cart.map(i => ({ code: i.code, quantity: i.quantity, sauceOff: !!i.sauceOff })),
+          skip: isSwap ? planState.skip : []
+        })
+      });
+      if (seq !== planState.seq) return;  // 条件已变，丢弃过期结果（场景八）
+      planState.last = d;
+      renderCond(d);
+      renderPlans(d);
+    } catch (e) {
+      if (seq !== planState.seq) return;
+      $('#plan-note').innerHTML = `<div class="warn err">${esc((e.state || '查询失败') + '：' + e.message)}</div>`;
+    } finally {
+      if (seq === planState.seq) {
+        btn.disabled = false;
+        btn.textContent = (planState.last && (planState.last.plans || []).length) ? '重新生成' : '生成方案';
+      }
+    }
+  }
+
+  async function applyPlan(plan) {
+    if (!plan || planState.applying) return;  // 重复点击不重复加餐
+    planState.applying = true;
+    const btns = document.querySelectorAll('#plan-list [data-apply]');
+    btns.forEach(b => { b.disabled = true; });
+    try {
+      for (const it of plan.items || []) {
+        if (it.locked) continue;  // 已在购物车里的不重复加
+        const exist = state.cart.find(x => x.code === it.code);
+        if (exist) { exist.quantity += it.quantity; continue; }
+        // 后端 kcal 是该模式下已算好的单份值（减脂汉堡已扣去酱），
+        // baseKcal 要还原成"未扣"的基数，否则 unitKcalOf 会再扣一次 45
+        const base = Number(it.kcal || 0) + (it.sauceOff ? sauceKcalOf() : 0);
+        state.cart.push({
+          code: it.code, name: it.name, price: it.price, kind: it.kind,
+          baseKcal: base, sauceOff: !!it.sauceOff,
+          sauceAvailable: it.sauceOff ? true : null,
+          fixedSauce: state.mode === 'lean' && it.kind === 'burger' && !!it.sauceOff,
+          macros: it.macros || null,
+          quantity: it.quantity || 1, creamerUnits: 0
+        });
+      }
+      store.save();
+      closePlan();
+      renderCartBar();
+      await refreshPrice();
+      openCart();  // 应用后进购物车核对价格与定制，不直接下单
+    } finally {
+      planState.applying = false;
+      btns.forEach(b => { b.disabled = false; });
+    }
+  }
+
+  // 事件绑定
+  $('#btn-search').onclick = searchStores;
+  $('#btn-locate').onclick = locate;
+  $('#keyword').addEventListener('keydown', e => { if (e.key === 'Enter') searchStores(); });
+  $('#btn-switch-store').onclick = () => { $('#cart-sheet').classList.remove('on'); show('screen-store'); };
+  document.querySelectorAll('.mode[data-mode]').forEach(b => b.onclick = async () => {
+    if (state.mode === b.dataset.mode) return;
+    state.mode = b.dataset.mode;
+    document.querySelectorAll('.mode[data-mode]').forEach(x => x.classList.toggle('on', x === b));
+    if (state.mode === 'lean') {
+      const blocked = state.cart.filter(i => i.kind === 'other');
+      if (blocked.length) {
+        if (!confirm('切换到减脂模式会移除 ' + blocked.length + ' 项不符合范围的餐品，继续？')) {
+          state.mode = 'normal';
+          document.querySelectorAll('.mode[data-mode]').forEach(x => x.classList.toggle('on', x.dataset.mode === 'normal'));
+          return;
+        }
+        state.cart = state.cart.filter(i => i.kind !== 'other');
+        // 减脂模式：购物车里的汉堡一并对齐“强制去酱”
+        state.cart.forEach(i => {
+          if (i.kind === 'burger' && i.sauceAvailable) { i.sauceOff = true; i.fixedSauce = true; }
+        });
+        store.save(); refreshPrice();
+      }
+    } else {
+      // 回到普通模式：保留已去酱，但允许再次修改
+      state.cart.forEach(i => { i.fixedSauce = false; });
+      store.save();
+    }
+    await loadMenu();
+  });
+  $('#q').addEventListener('input', () => renderGoods());
+  $('#bar-go').addEventListener('click', () => openCart());
+  $('#cart-sheet').addEventListener('click', (e) => { if (e.target.id === 'cart-sheet') { e.currentTarget.classList.remove('on'); document.body.classList.remove('sheet-open'); renderCartBar(); } });
+  $('#confirm-sheet').addEventListener('click', (e) => { if (e.target.id === 'confirm-sheet') { e.currentTarget.classList.remove('on'); document.body.classList.remove('sheet-open'); renderCartBar(); } });
+  $('#btn-confirm').onclick = openConfirm;
+  $('#btn-back-cart').onclick = () => { $('#confirm-sheet').classList.remove('on'); openCart(); };
+  $('#btn-create').onclick = () => alert('下单接口未接入。按 PRD 需要你明确确认后才会开启真实下单。');
+
+  // 智能配餐
+  $('#btn-plan').onclick = openPlan;
+  $('#btn-plan-run').onclick = () => runPlan(false);
+  $('#plan-text').addEventListener('keydown', e => { if (e.key === 'Enter') runPlan(false); });
+  $('#plan-chips').querySelectorAll('.chip').forEach(c => c.onclick = () => {
+    const el = $('#plan-text');
+    const fill = c.dataset.fill;
+    const cur = (el.value || '').trim();
+    if (cur.includes(fill)) return;
+    el.value = cur ? cur.replace(/[，,]\s*$/, '') + '，' + fill : fill;
+    el.focus();
+  });
+  $('#plan-sheet').addEventListener('click', (e) => { if (e.target.id === 'plan-sheet') closePlan(); });
+
+  // 启动
+  (async () => {
+    await health();
+    if (store.load() && state.store) { await openMenu(); if (state.cart.length) refreshPrice(); }
+  })();
+})();
+</script>
+</body>
+</html>

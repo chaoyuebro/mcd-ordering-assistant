@@ -1,0 +1,26 @@
+# 热量估算参数（PRD §1.4.4）
+#
+# reviewed: false 表示这些数值只是实现初稿的占位默认值，**尚未经用户确认**。
+# 它们只影响 estimate 结果，永远不会覆盖 official 数据；改动本文件不影响判定逻辑。
+
+version: 1
+reviewed: true
+updated: "2026-10-24"
+reviewedNote: "2026-10-24 用户确认：去酱 45 kcal/份、奶油球 20 kcal/颗 即按此执行；后续如调整需升版本"
+
+# 去酱扣减：每去除一份酱料估算减少的热量（千卡）
+sauce_kcal_per_serving: 45
+
+# 奶油球：每颗估算热量（千卡），可选数量以门店接口返回为准
+creamer_kcal_per_unit: 20
+
+# 既无 official 记录、也无人工估算值时，按商品大类给一个兜底估算
+heuristic_kcal_by_kind:
+  burger: 500
+  combo: 750
+  side: 250
+  drink: 150
+  coffee_black: 10
+  coffee_milk: 180
+  dessert: 300
+  other: 200

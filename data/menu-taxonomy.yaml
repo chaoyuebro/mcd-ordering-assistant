@@ -1,0 +1,116 @@
+# 减脂范围判定配置（对应 PRD-001 §1.4.5）
+#
+# 判定顺序：分类归一 → 套餐组成校验 → 商品清单兜底。
+# 本文件与营养基准表共用同一版本号，Skill 与 H5 必须使用同一份。
+#
+# 实测来源：
+#   2026-10-24 上海 1450713 麦当劳上海黄浦华旭国际大厦餐厅 → data/menu-categories.snapshot.json
+#   2026-10-24 郑州 3560134 麦当劳郑州西太康路新华书店餐厅 → data/menu-categories.zhengzhou.json
+# 跨城结论：分类名集合两地一致（郑州少“蘸酱炸鸡”），归一表可跨城复用；
+#           但分类内商品随门店变化，新增/区域限定 SKU 一律不预置——命中不到清单即排除。
+
+version: 4
+updated: "2026-10-24"
+source: "data/menu-categories.snapshot.json（上海 1450713）＋ data/menu-categories.zhengzhou.json（郑州 3560134）＋ 门店 3560147 复核"
+
+# ── 分类名归一（匹配前必须先做） ───────────────────────────────────────────
+# 接口返回的分类名带换行符，例如 "鸡肉汉堡\n/卷"、"麦咖啡™"。
+# 匹配键的生成规则（两层都实现，顺序执行）：
+#   1. 删除所有换行符 \r \n
+#   2. 删除首尾空白与中间的半角/全角空格
+# 生成后与下表键做**精确匹配**；不做模糊匹配、不做关键词包含匹配。
+# 例："鸡肉汉堡\n/卷" -> "鸡肉汉堡/卷"；"500\n大卡套餐" -> "500大卡套餐"
+normalize:
+  strip_newlines: true
+  strip_spaces: true
+  fuzzy_match: false
+
+# ── 第一层：门店分类名（归一后）→ 内部类目 ────────────────────────────────
+# 实测 15 个分类中：汉堡相关 3 个、咖啡 1 个，其余 11 个为 other。
+category_map:
+  # 汉堡：实测没有字面叫“汉堡”的分类，汉堡分在三个子类里
+  # 注意：接口里的换行被归一后是“巨无霸牛鱼肉堡”“安格斯MAX厚牛堡”，**没有斜杠**；
+  #      早期误写成带斜杠的键，导致这两个分类被判成“其他”，单品汉堡被整类隐藏。
+  "鸡肉汉堡/卷": burger
+  "巨无霸牛鱼肉堡": burger
+  "巨无霸/牛鱼肉堡": burger        # 别名：部分门店带斜杠
+  "安格斯MAX厚牛堡": burger
+  "安格斯MAX/厚牛堡": burger       # 别名
+
+  # 咖啡：实测类目名带商标符号，不是“咖啡”
+  "麦咖啡™": coffee
+  "麦咖啡": coffee        # 别名：部分门店可能不带 ™
+
+  # 其余分类显式归为 other，便于评审“为什么它没进减脂”
+  "人气热卖": other
+  "精选单人餐": other
+  "小食拼盘/多人餐": other
+  "蘸酱炸鸡": other
+  "随心配1+1": other
+  "炸鸡": other
+  "大堡口福单人餐": other
+  "开心乐园": other
+  "小食甜品/其他": other
+  "500大卡套餐": other
+  "饮品": other
+
+# 未在 category_map 中出现的分类名一律按 other 处理，不得猜测为 burger 或 coffee。
+
+# ── 第二层：组成校验（代码实现，不在此配置） ──────────────────────────────
+# 实测证据：分类不能定“是不是单品”——
+#   · "鸡肉汉堡/卷" 16 项中多数为三件套/四件套套餐
+#   · "巨无霸/牛鱼肉堡" 22 项几乎全是四件套
+#   · "炸鸡" 分类里混入“韩式烟熏芝士风味酱”等蘸酱
+#   · "小食甜品/其他" 里混入丝巾、棒球帽等周边商品
+# 因此：分类命中 burger 只是候选，必须查 query-meal-detail 的 rounds：
+#   有 rounds 且含饮品/小食 -> 按套餐逐成员判定，不合规则整份不放行，也不拆单
+
+# ── 第三层：商品清单兜底 ──────────────────────────────────────────────────
+product_overrides:
+  # 黑咖啡（麦咖啡™ 分类下仅这三项符合“以黑咖啡为基础”）
+  - productCode: "507411"
+    name: "麦咖啡™美式"
+    category: coffee
+    black_coffee: true
+  - productCode: "520689"
+    name: "鲜萃咖啡"
+    category: coffee
+    black_coffee: true
+  - productCode: "507389"
+    name: "浓缩咖啡"
+    category: coffee
+    black_coffee: true
+
+  # 含奶或含甜品，显式排除（防止被“麦咖啡™”分类带进来）
+  - { productCode: "507409", name: "麦咖啡™奶铁", category: coffee, black_coffee: false }
+  - { productCode: "510479", name: "燕麦奶铁", category: coffee, black_coffee: false }
+  - { productCode: "507387", name: "卡布奇诺", category: coffee, black_coffee: false }
+  - { productCode: "514851", name: "咖啡阿芙佳朵", category: coffee, black_coffee: false }
+  - { productCode: "514850", name: "抹茶阿芙佳朵", category: coffee, black_coffee: false }
+  - { productCode: "515946", name: "浓浓黑巧（冰/热）", category: other, note: "巧克力饮品，非咖啡" }
+  - { productCode: "515955", name: "浓浓燕麦黑巧", category: other, note: "巧克力饮品，非咖啡" }
+  - { productCode: "507394", name: "牛奶", category: other }
+  - { productCode: "510488", name: "燕麦奶", category: other }
+
+  # 郑州门店出现、上海没有的非黑咖啡项（区域/门店限定的冰品与奶饮）
+  - { productCode: "9900015561", name: "麦咖啡冰爽一夏", category: other, note: "组合商品，非纯咖啡" }
+  - { productCode: "521871", name: "美禄可可雪冰", category: other, note: "可可奶饮" }
+  - { productCode: "521791", name: "茉莉奶绿雪冰", category: other, note: "茶饮" }
+
+  # 分类归属存疑：名称称“单品精选”，但为组合商品，必须靠 rounds 校验
+  - productCode: "9900008746"
+    name: "鸡肉堡单品精选"
+    category: other
+    note: "名称与形态不一致，暂按分类兜底排除；若详情无 rounds 且仅含一个汉堡，可评估放开"
+
+# 观测特征（仅供排查，不作为判定依据）：
+#   单品汉堡编码多为 4~6 位（1406 板烧鸡腿堡、1440 麦辣鸡腿汉堡、1450 麦香鸡、521952/521953 龙焰）
+#   套餐编码多为 9900xxxxxx，名称含 三件套/四件套/双人餐/套餐/开心乐园餐
+# 判定必须以 rounds 为准，不得用编码位数或名称关键词决定是否放行。
+
+# 奶油球：仅对允许的咖啡开放，选项与价格仍以门店接口返回为准
+creamer:
+  allowed_categories: [coffee]
+  allowed_products: ["507411", "520689", "507389"]
+  default: none
+  options_source: "query-meal-detail 的 modification"

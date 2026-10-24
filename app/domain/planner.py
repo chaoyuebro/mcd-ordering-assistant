@@ -1,0 +1,992 @@
+"""智能配餐（PRD US-03）。
+
+三件事，按 PRD 的顺序：
+1. **解析需求**：只认文本里真实出现过的条件，没提的绝不自作主张补上限（规则 2）。
+   临界值语义严格区分：「不超过/以内/以下」含上限，「低于/小于」不含（规则 3）。
+2. **生成组合**：在模式允许的候选里做有界枚举，先满足必选项/热量/预算，再按偏好排序（规则 4、5）。
+3. **真实试算**：最终方案必须调 calculate-price 拿优惠后应付金额，估算价只用于初筛（规则 5、场景五）。
+
+不在这里做的事：不创建订单、不静默放宽条件、不把未试算的价格标成应付价。
+"""
+
+from __future__ import annotations
+
+import itertools
+import re
+from typing import Any
+
+from . import coupons, nutrition
+
+# 展示方案上限（PRD 规则 5）
+MAX_PLANS = 3
+# 组合枚举上限，防止门店菜单特别大时炸掉
+MAX_CANDIDATES = 600
+# 初筛后最多试算几个候选（每个候选还会内部比较券，见 coupons.MAX_TRIALS）
+MAX_TRIAL_CANDIDATES = 12
+# 无解时为了给出可信的最低实价，最多多试几组（列表价不可信）
+BLOCKER_TRIALS = 6
+# 单个候选的试算预算（含无券基线），控制整个配餐请求的耗时
+TRIAL_BUDGET = 4
+
+CN_NUM = {
+    "一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+KCAL_UNIT = r"(?:千卡|大卡|kcal|Kcal|KCAL|卡路里|卡)"
+MONEY_UNIT = r"(?:元钱|元|块|RMB|rmb|¥)"
+# 「含上限」的措辞
+INCL_WORDS = r"(?:不超过|不得超过|以内|以下|之内|最多|至多|控制在|控制到|限制在|限|别超过)"
+# 「不含上限」的措辞
+EXCL_WORDS = r"(?:低于|小于|少于|不到|不高于)"
+
+# 主餐 / 饮品 / 小食的类目划分
+MAIN_KINDS = ("burger", "combo")
+DRINK_KINDS = ("coffee", "drink")
+SIDE_KINDS = ("side", "dessert")
+STRUCT_KINDS = {"burger": "主餐", "combo": "套餐", "coffee": "咖啡", "drink": "饮品", "side": "小食", "dessert": "甜品"}
+
+
+def _cn2int(text: str) -> int:
+    if text.isdigit():
+        return int(text)
+    return CN_NUM.get(text, 0)
+
+
+def _clean_name(name: str) -> str:
+    return re.sub(r"[™®\s（）()·\-—_]", "", name or "")
+
+
+def _name_hit(name: str, text: str) -> bool:
+    """商品名是否被用户提到。允许少写「汉堡/卷/咖啡」这类后缀。
+
+    短名（薯条、可乐等 2 字）也要认，否则「要一份薯条」永远识别不出来；
+    这里要求的是**完整名称**原样出现，误伤风险很低。
+    """
+    full = _clean_name(name)
+    if len(full) >= 2 and full in text:
+        return True
+    for suffix in ("汉堡", "咖啡", "卷", "堡", "茶"):
+        if full.endswith(suffix) and len(full) - len(suffix) >= 2:
+            stem = full[: -len(suffix)]
+            if stem in text:
+                return True
+    # 用户可能只写了名字中间一段（≥4 字较安全）
+    return len(full) >= 5 and full[:4] in text
+
+
+# ---------- 1. 解析需求 ----------
+
+# 三大营养素的自然语言别名（长词在前，避免「碳水」抢走「碳水化合物」）
+MACRO_ALIASES = (
+    ("protein", r"(?:蛋白质|蛋白)"),
+    ("fat", r"(?:脂肪)"),
+    ("carbohydrate", r"(?:碳水化合物|碳水)"),
+)
+MACRO_LABEL = {"protein": "蛋白质", "fat": "脂肪", "carbohydrate": "碳水"}
+
+# 下限措辞 / 上限措辞；标记为 exclusive 的不含边界（与热量口径一致，PRD 规则 3）
+MIN_OPS = r"(?:≥|>=|不低于|不少于|至少|超过|高于|多于)"
+MAX_OPS = r"(?:≤|<=|不超过|不高于|不多于|最多|至多|低于|少于|小于)"
+EXCLUSIVE_OPS = ("超过", "高于", "多于", "低于", "少于", "小于")
+SUFFIX_MIN = r"(?:以上|及以上)"
+SUFFIX_MAX = r"(?:以内|以下|之内|以里)"
+
+
+def _grab_macro(text: str, word_re: str) -> dict | None:
+    """抓「蛋白质30g以上 / 脂肪不超过20g / 碳水低于50g」这类限定。
+
+    两种语序都认（操作符在前、量词后缀在后），方向和含不含边界都要判：
+    蛋白质通常是下限、脂肪碳水通常是上限，但都按用户原文来，不预设。
+    """
+    m = re.search(
+        rf"{word_re}\s*(?P<op>{MIN_OPS}|{MAX_OPS})?\s*(?P<v>\d+(?:\.\d+)?)\s*(?:g|G|克)",
+        text,
+    )
+    if not m:
+        return None
+
+    op = (m.group("op") or "").strip()
+    value = float(m.group("v"))
+    tail = text[m.end(): m.end() + 3]
+
+    if op:
+        is_min = bool(re.fullmatch(MIN_OPS, op))
+        inclusive = op not in EXCLUSIVE_OPS
+    elif re.match(SUFFIX_MAX, tail):
+        is_min, inclusive = False, True
+    elif re.match(SUFFIX_MIN, tail):
+        is_min, inclusive = True, True
+    else:
+        # 只写了数字（「蛋白质 30g」）：按“至少”理解，具体口径在标签里写明
+        is_min, inclusive = True, True
+
+    suffix = re.match(rf"(?:{SUFFIX_MIN}|{SUFFIX_MAX})?", tail).group(0)
+    return {
+        "value": value,
+        "min": is_min,
+        "inclusive": inclusive,
+        "text": text[m.start(): m.end() + len(suffix)],
+    }
+
+
+def _grab_limit(text: str, unit_re: str, extra_patterns: tuple[str, ...] = ()) -> dict | None:
+    """抓一个数值上限，并判断是否包含边界。
+
+    语序两种都认：「不超过 1000 千卡」「1000 千卡以内」。
+    只有带明确措辞的才判断含不含边界，裸数字按含边界处理（PRD 规则 3 只约束前者）。
+    """
+    patterns = (
+        rf"(?P<w>{INCL_WORDS}|{EXCL_WORDS})\s*(?P<v>\d+(?:\.\d+)?)\s*{unit_re}",
+        rf"(?P<v>\d+(?:\.\d+)?)\s*{unit_re}\s*(?P<p>以内|以下|之内|以里|内)",
+        rf"(?P<v>\d+(?:\.\d+)?)\s*{unit_re}",
+        *extra_patterns,  # 没有单位的写法放最后兜底（如「预算40」）
+    )
+    for pat in patterns:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        word = m.groupdict().get("w") or ""
+        if m.groupdict().get("p"):
+            inclusive = True
+        elif word:
+            inclusive = bool(re.search(INCL_WORDS, word)) and not re.search(EXCL_WORDS, word)
+        else:
+            inclusive = True
+        return {"value": float(m.group("v")), "inclusive": inclusive, "text": m.group(0)}
+    return None
+
+
+def parse_request(text: str, items: list[dict], mode: str) -> dict:
+    """把自然语言拆成结构化条件。返回的每一条都带原文依据，便于前端展示核对。"""
+    raw = (text or "").strip()
+    t = raw.replace(" ", "")
+    recognized: list[dict] = []
+    unresolved: list[str] = []
+
+    # --- 热量上限 ---
+    kcal_limit = None
+    got = _grab_limit(t, KCAL_UNIT)
+    if got:
+        kcal_limit = {"value": int(got["value"]), "inclusive": got["inclusive"], "text": got["text"]}
+        recognized.append(
+            {
+                "type": "kcalMax",
+                "value": kcal_limit["value"],
+                "inclusive": kcal_limit["inclusive"],
+                "label": f"热量上限 {kcal_limit['value']} 千卡（{'含' if kcal_limit['inclusive'] else '不含'}上限）",
+                "source": got["text"],
+            }
+        )
+
+    # --- 预算上限 ---
+    budget = None
+    got = _grab_limit(t, MONEY_UNIT, extra_patterns=(rf"(?:预算|花费|总价)(?:是|大概|约)?\s*(?P<v>\d+(?:\.\d+)?)",))
+    if got:
+        budget = {"value": got["value"], "inclusive": got["inclusive"], "text": got["text"]}
+        recognized.append(
+            {
+                "type": "budget",
+                "value": budget["value"],
+                "inclusive": budget["inclusive"],
+                "label": f"预算 {budget['value']:g} 元（{'含' if budget['inclusive'] else '不含'}上限）",
+                "source": got["text"],
+            }
+        )
+
+    # --- 排除项：先抓「不要X」，再把 X 反查成具体商品 ---
+    excluded: list[str] = []
+    for m in re.finditer(r"(?:不要|不吃|别要|去掉|不想吃|排除)\s*([^，,。;；、\s]{2,10})", t):
+        frag = _clean_name(m.group(1))
+        if len(frag) < 2:
+            continue
+        hits = [it for it in items if frag in _clean_name(it["name"])]
+        for it in hits:
+            if it["code"] not in excluded:
+                excluded.append(it["code"])
+                recognized.append(
+                    {"type": "exclude", "value": it["code"], "label": f"排除：{it['name']}", "source": m.group(0)}
+                )
+        if not hits:
+            unresolved.append(f"「{m.group(1)}」在当前门店菜单里没找到，未作为排除项加入")
+
+    # --- 必选项：文本里点名的商品 ---
+    must: list[str] = []
+    for it in items:
+        if it["code"] in excluded:
+            continue
+        if _name_hit(it["name"], t):
+            must.append(it["code"])
+            recognized.append(
+                {"type": "must", "value": it["code"], "label": f"必选：{it['name']}", "source": it["name"]}
+            )
+
+    # 同名前缀可能命中多个商品（如「巨无霸」命中普通装与套餐），保留全部但不重复提示
+    must = list(dict.fromkeys(must))
+
+    # --- 偏好 ---
+    prefs: list[str] = []
+    if re.search(r"(便宜|省钱|实惠|划算|低成本|少花钱)", t):
+        prefs.append("cheap")
+        recognized.append({"type": "pref", "value": "cheap", "label": "偏好：更便宜", "source": "便宜/省钱"})
+    if re.search(r"(吃饱|管饱|够吃|顶饱|分量足|吃爽)", t):
+        prefs.append("full")
+        recognized.append({"type": "pref", "value": "full", "label": "偏好：尽量吃饱", "source": "吃饱/管饱"})
+
+    # --- 数量约束 ---
+    counts = {"main": 1, "drink": 1, "side": 0}
+    explicit_counts = False
+    for m in re.finditer(r"(\d+|[一两二三四五六七八九十])\s*(?:个|份|杯|块|只)?\s*(汉堡|堡|主餐|套餐|咖啡|饮品|饮料|小食|薯条|鸡翅|可乐)", t):
+        n = _cn2int(m.group(1))
+        if n <= 0:
+            continue
+        word = m.group(2)
+        if word in ("汉堡", "堡", "主餐", "套餐"):
+            counts["main"] = min(n, 3)
+        elif word in ("咖啡", "饮品", "饮料", "可乐"):
+            counts["drink"] = min(n, 3)
+        elif word in ("小食", "薯条", "鸡翅"):
+            counts["side"] = min(n, 3)
+        explicit_counts = True
+        recognized.append(
+            {"type": "count", "value": {word: n}, "label": f"{word} ×{n}", "source": m.group(0)}
+        )
+
+    # 「只要一个汉堡」「不用饮料」这类，把饮品归零
+    if re.search(r"(不要|不用|不加|别要)\s*(?:饮料|饮品|咖啡|喝的)", t):
+        counts["drink"] = 0
+        explicit_counts = True
+        recognized.append({"type": "count", "value": {"drink": 0}, "label": "不需要饮品", "source": "不要饮料"})
+
+    # 减脂模式：至少要有主餐，且默认配一杯黑咖啡（这是该模式的常见形态，明示给用户）
+    if mode == "lean" and not explicit_counts:
+        recognized.append(
+            {
+                "type": "default",
+                "value": "lean-structure",
+                "label": "默认搭配：主餐 1 + 咖啡 1（未指定结构时按此生成，可修改）",
+                "source": "默认",
+            }
+        )
+
+    # --- 三大营养素限制（蛋白质 / 脂肪 / 碳水）---
+    macro_limits: dict[str, dict] = {}
+    for key, word_re in MACRO_ALIASES:
+        got = _grab_macro(t, word_re)
+        if not got:
+            continue
+        macro_limits[key] = got
+        if got["min"]:
+            sign = "≥" if got["inclusive"] else ">"
+        else:
+            sign = "≤" if got["inclusive"] else "<"
+        recognized.append(
+            {
+                "type": "macro",
+                "value": {key: got["value"]},
+                "label": f"{MACRO_LABEL[key]} {sign}{got['value']:g}g",
+                "source": got["text"],
+            }
+        )
+
+    return {
+        "text": raw,
+        "kcalLimit": kcal_limit,
+        "budget": budget,
+        "macroLimits": macro_limits,
+        "must": must,
+        "exclude": excluded,
+        "prefs": prefs,
+        "counts": counts,
+        "explicitCounts": explicit_counts,
+        "recognized": recognized,
+        "unresolved": unresolved,
+    }
+
+
+# ---------- 2. 组合生成 ----------
+
+
+def _unit_kcal(item: dict, sauce_off: bool) -> float:
+    """单份热量。菜单项里的 kcal.unit 已是该模式下的最终值（减脂汉堡已扣去酱）。"""
+    unit = float((item.get("kcal") or {}).get("unit") or 0)
+    auto_off = bool(item.get("autoSauceRemoved"))
+    if sauce_off and not auto_off and item.get("hasSauces"):
+        params = nutrition.load_estimate_params()
+        unit = max(0.0, unit - float(params.get("sauce_kcal_per_serving") or 0))
+    return unit
+
+
+def _unit_price(item: dict) -> float:
+    try:
+        return float(item.get("price") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# 每克营养素的上限产能（蛋白/碳水 4 kcal，脂肪 9 kcal）。
+# 用它把「只有热量、没有营养素」的商品换算成一个严格上界，而不是当 0 或瞎填。
+KCAL_PER_GRAM = {"protein": 4.0, "fat": 9.0, "carbohydrate": 4.0}
+
+
+def _macro_bounds(rows: list[dict]) -> tuple[dict, dict, bool, bool]:
+    """返回 (下界, 上界, 是否全部有官方营养素, 是否有商品连热量都没有)。
+
+    有官方值的商品：上下界相同，都是精确值。
+    缺官方值的商品：
+      - 下界按 0（不知道就是不知道，不能往上加）；
+      - 上界按热量反推——1g 脂肪最多提供 9 kcal，所以脂肪 ≤ 热量/9；蛋白、碳水各自 ≤ 热量/4。
+        这是能量守恒给出的硬上界，不是估算值，也不需要编数据。
+      - 若连热量都没有，上界推不出来，这条候选只能算「无法确认」。
+    因此：下限条件用下界判「确定达标」，上限条件用上界判「确定不超标」。
+    去酱只扣热量不扣营养素，属于保守方向（营养素偏高），不影响上界的用法。
+    """
+    low = {key: 0.0 for key in KCAL_PER_GRAM}
+    high = {key: 0.0 for key in KCAL_PER_GRAM}
+    complete = True
+    unknown_energy = False
+    for row in rows:
+        quantity = int(row.get("quantity") or 1)
+        macros = row.get("macros")
+        if macros:
+            for key in low:
+                value = float(macros.get(key) or 0) * quantity
+                low[key] += value
+                high[key] += value
+            continue
+        complete = False
+        kcal = float(row.get("kcal") or 0) * quantity
+        if kcal <= 0:
+            unknown_energy = True
+        for key, per_gram in KCAL_PER_GRAM.items():
+            high[key] += kcal / per_gram
+    return low, high, complete, unknown_energy
+
+
+def _macro_pass(value: float, limit: dict) -> bool:
+    """判断某营养素是否满足限制，边界含不含严格按解析结果。"""
+    target = float(limit["value"])
+    if limit["min"]:
+        return value >= target if limit["inclusive"] else value > target
+    return value <= target if limit["inclusive"] else value < target
+
+
+def _pool_by_kind(items: list[dict], mode: str) -> dict[str, list[dict]]:
+    pool: dict[str, list[dict]] = {}
+    for it in items:
+        kind = (it.get("decision") or {}).get("kind") or "other"
+        if mode == "lean" and kind not in ("burger", "coffee"):
+            continue  # 减脂模式只用菜单已过滤的结果，这里再兜一层
+        pool.setdefault(kind, []).append(it)
+    return pool
+
+
+def generate(
+    items: list[dict],
+    parsed: dict,
+    *,
+    mode: str,
+    skip: list[list[str]] | None = None,
+    locked: list[dict] | None = None,
+) -> dict:
+    """生成候选组合（未试算）。
+
+    locked 只用于「购物车里已有的商品不再重复推荐」，**不参与**方案的热量与金额累加：
+    配餐展示的价格和卡路里只反映方案自身，避免用户把方案数值读成整车数值。
+    """
+    skip_sets = {frozenset(s) for s in (skip or [])}
+    locked = locked or []
+    locked_codes = {c["code"] for c in locked}
+
+    pool = _pool_by_kind(items, mode)
+    by_code = {it["code"]: it for it in items}
+    excluded = set(parsed["exclude"]) | locked_codes  # 已在购物车里的不再推荐一遍
+    must_codes = [c for c in parsed["must"] if c not in excluded]
+    counts = parsed["counts"]
+
+    mains = [it for k in MAIN_KINDS for it in pool.get(k, []) if it["code"] not in excluded]
+    drinks = [it for k in DRINK_KINDS for it in pool.get(k, []) if it["code"] not in excluded]
+    sides = [it for k in SIDE_KINDS for it in pool.get(k, []) if it["code"] not in excluded]
+
+    # 必选项如果本身是主餐/饮品，先从对应池子里拿掉，避免重复计数
+    must_items = [by_code[c] for c in must_codes if c in by_code]
+    must_codes_set = {it["code"] for it in must_items}
+    mains = [it for it in mains if it["code"] not in must_codes_set]
+    drinks = [it for it in drinks if it["code"] not in must_codes_set]
+    sides = [it for it in sides if it["code"] not in must_codes_set]
+
+    n_main = max(0, int(counts.get("main") or 0))
+    n_drink = max(0, int(counts.get("drink") or 0))
+    n_side = max(0, int(counts.get("side") or 0))
+    # 必选项已经占掉了主餐/饮品的位置
+    buy_main = max(0, n_main - len([it for it in must_items if (it.get("decision") or {}).get("kind") in MAIN_KINDS]))
+    buy_drink = max(0, n_drink - len([it for it in must_items if (it.get("decision") or {}).get("kind") in DRINK_KINDS]))
+
+    main_groups = _combo_pool(mains, buy_main)
+    drink_groups = _combo_pool(drinks, buy_drink)
+    side_groups = _combo_pool(sides, n_side) if n_side else [[]]
+
+    # 默认结构（用户没提数量）遇到门店没有该类候选时，降级为不配这一类并说明；
+    # 用户明确要求过数量的，不擅自降级，直接报阻碍（PRD 规则 10）。
+    downgrades: list[str] = []
+    if buy_main and not main_groups:
+        if parsed["explicitCounts"]:
+            return {
+                "plans": [],
+                "blocker": {"code": "no-main", "message": "你要求了主餐，但当前门店在%s下没有可用的主餐候选" % ("减脂模式" if mode == "lean" else "全部餐品")},
+            }
+        buy_main, main_groups = 0, [[]]
+        downgrades.append("门店没有主餐候选，本次只配了饮品")
+    if buy_drink and not drink_groups:
+        if parsed["explicitCounts"]:
+            return {
+                "plans": [],
+                "blocker": {"code": "no-drink", "message": "你要求了饮品，但当前门店没有可用的饮品候选"},
+            }
+        buy_drink, drink_groups = 0, [[]]
+        downgrades.append(
+            "本店没有符合减脂口径的黑咖啡，本次只配了主餐"
+            if mode == "lean"
+            else "门店没有饮品候选，本次只配了主餐"
+        )
+
+    kcal_limit = parsed["kcalLimit"]
+    budget = parsed["budget"]
+    macro_limits = parsed.get("macroLimits") or {}
+    prefs = parsed["prefs"]
+    macro_uncertain = 0  # 因缺官方营养素、无法确认是否达标而被排除的候选数
+
+    all_candidates: list[dict] = []
+    for mg, dg, sg in itertools.product(main_groups, drink_groups, side_groups):
+        chosen = list(must_items) + list(mg) + list(dg) + list(sg)
+        if not chosen:
+            continue
+        codes = [it["code"] for it in chosen] + [c["code"] for c in locked]
+        if frozenset(codes) in skip_sets:
+            continue
+        # 同款出现多次要合并成数量，不能当成重复项丢掉
+        qty_map: dict[str, int] = {}
+        for it in chosen:
+            qty_map[it["code"]] = qty_map.get(it["code"], 0) + 1
+
+        rows = []
+        for code, qty in qty_map.items():
+            it = by_code[code]
+            sauce_off = mode == "lean" and (it.get("decision") or {}).get("kind") == "burger" and bool(it.get("hasSauces"))
+            rows.append(
+                {
+                    "code": it["code"],
+                    "name": it["name"],
+                    "price": _unit_price(it),
+                    "quantity": qty,
+                    "kcal": _unit_kcal(it, sauce_off),
+                    "kcalSource": (it.get("kcal") or {}).get("source") or "unknown",
+                    # 三大营养素只认官方同名值，缺了就是 None（不估算）
+                    "macros": it.get("macros"),
+                    "sauceOff": sauce_off,
+                    "kind": (it.get("decision") or {}).get("kind") or "other",
+                    "locked": False,
+                }
+            )
+
+        # 配餐口径：方案自身的热量与金额独立计算，不叠加购物车已有商品
+        raw_kcal = sum(r["kcal"] * r["quantity"] for r in rows)
+        raw_price = sum(r["price"] * r["quantity"] for r in rows)
+
+        over_kcal = False
+        if kcal_limit is not None:
+            limit = float(kcal_limit["value"])
+            over_kcal = raw_kcal > limit if kcal_limit["inclusive"] else raw_kcal >= limit
+        # 预算先用估算价粗筛（留 15% 弹性，券后价可能更低）
+        over_budget = False
+        if budget is not None:
+            over_budget = raw_price > float(budget["value"]) * 1.15
+
+        macro_low, macro_high, macro_complete, macro_unknown = _macro_bounds(rows)
+        over_macro = False
+        if macro_limits:
+            for key, limit in macro_limits.items():
+                # 下限：下界已达标 → 真实值必然达标；上界：上界都没超 → 真实值必然没超
+                bound = macro_low[key] if limit["min"] else macro_high[key]
+                if not _macro_pass(bound, limit):
+                    over_macro = True
+                    if macro_unknown:
+                        # 连热量都没有，是「判不了」，不是「确定不达标」
+                        macro_uncertain += 1
+                    break
+
+        all_candidates.append(
+            {
+                "rows": rows,
+                "rawKcal": raw_kcal,
+                "rawPrice": raw_price,
+                "count": sum(r["quantity"] for r in rows),
+                "overKcal": over_kcal,
+                "overBudget": over_budget,
+                "overMacro": over_macro,
+                "macros": macro_low,
+                "macroIncomplete": not macro_complete,
+            }
+        )
+        if len(all_candidates) >= MAX_CANDIDATES:
+            break
+
+    passed = [
+        c for c in all_candidates
+        if not c["overKcal"] and not c["overBudget"] and not c["overMacro"]
+    ]
+
+    # 排序：用户偏好优先，否则按估算价 → 热量 → 件数（PRD 规则 5 的并列取舍）
+    if "full" in prefs:
+        passed.sort(key=lambda c: (-c["rawKcal"], c["rawPrice"], c["count"]))
+    else:
+        passed.sort(key=lambda c: (c["rawPrice"], c["rawKcal"], c["count"]))
+
+    if not passed:
+        return {
+            "plans": [],
+            # 用真实存在过的候选说明阻碍，避免"最轻单品"式的错解释
+            "lightest": min(all_candidates, key=lambda c: (c["rawKcal"], c["rawPrice"])) if all_candidates else None,
+            "cheapest": min(all_candidates, key=lambda c: (c["rawPrice"], c["rawKcal"])) if all_candidates else None,
+            # 供上层多试几组真实价格：列表价不可信，只试「列表价最低」会得出错误结论
+            "candidates": all_candidates,
+            "totalCandidates": len(all_candidates),
+            "macroUncertain": macro_uncertain,
+            "downgrades": downgrades,
+        }
+
+    return {
+        "plans": passed,
+        "totalCandidates": len(passed),
+        "macroUncertain": macro_uncertain,
+        "downgrades": downgrades,
+    }
+
+
+def _combo_pool(pool: list[dict], n: int) -> list[list[dict]]:
+    """按份数取组合：n=0 → 空；n=1 → 每个单品；n≥2 → 可重复组合（同款 ×2 也算）。"""
+    if n <= 0:
+        return [[]]
+    if n == 1:
+        return [[it] for it in pool]
+    out = []
+    for combo in itertools.combinations_with_replacement(pool, n):
+        out.append(list(combo))
+        if len(out) >= MAX_CANDIDATES:
+            break
+    return out
+
+
+def _main_key(cand: dict) -> str:
+    """候选里的主餐编码，用来判断「换了一道不同的主食」。"""
+    return next((r["code"] for r in cand["rows"] if r["kind"] in MAIN_KINDS), "")
+
+
+def _trial_order(candidates: list[dict], limit: int) -> list[dict]:
+    """挑出要送去试算的候选，优先让不同主餐都有机会。
+
+    为什么不能直接取排序后的前几个：菜单列表价偶尔并不可信（燕麦奶铁列表
+    ¥9.9 实际试算 ¥27、板烧四件套列表 ¥28 实际 ¥87），一旦用户说「要吃饱」，
+    排序会按热量降序把一堆 750 兜底的套餐顶到最前，试算后全部超预算，
+    真正的便宜组合（如牛肉堡单品精选 + 鲜萃咖啡 ¥25.00）根本轮不到试算，
+    结果是「明明有解却报无解」。
+
+    为什么不能按饮品分组各取 N 个：多数门店的可选饮品就一两种，分组后每个
+    分组只取 2 个，等于把整个候选池压缩成 2 个——曾出现「14 组都符合条件却
+    只出 2 个方案」。
+
+    做法：按**主餐**分组，每组先取列表价最便宜的 1 个（保证三条方案不会是
+    同一个汉堡换三种咖啡），名额没满时再按列表价升序补齐（主餐种类少的门店
+    这时才靠饮品发散）。
+    """
+    groups: dict[str, list[dict]] = {}
+    for c in candidates:
+        groups.setdefault(_main_key(c), []).append(c)
+    for lst in groups.values():
+        lst.sort(key=lambda c: (c["rawPrice"], c["rawKcal"]))
+
+    out: list[dict] = []
+    seen: set[tuple] = set()
+
+    def take(c: dict) -> None:
+        sig = tuple(sorted(r["code"] for r in c["rows"]))
+        if sig in seen:
+            return
+        seen.add(sig)
+        out.append(c)
+
+    # 1) 每种主餐各占 1 个名额，按该主餐最便宜的列表价升序
+    for key in sorted(groups, key=lambda k: (groups[k][0]["rawPrice"], groups[k][0]["rawKcal"])):
+        if len(out) >= limit:
+            break
+        take(groups[key][0])
+
+    # 2) 剩余名额按列表价升序填满（主餐种类少时，这一段补充不同的饮品搭配）
+    for c in sorted(candidates, key=lambda c: (c["rawPrice"], c["rawKcal"])):
+        if len(out) >= limit:
+            break
+        take(c)
+    return out
+
+
+def _rows_text(rows: list[dict]) -> str:
+    """只描述本次新增的餐品，不提「已选」，避免与购物车已有商品混为一谈。"""
+    return " + ".join("%s×%d" % (r["name"], r["quantity"]) for r in rows)
+
+
+def _macros_text(macros: dict | None, incomplete: bool = False) -> str:
+    """给界面用的短文案，如「蛋白 32g · 脂肪 30g · 碳水 77g」。
+
+    有商品缺官方数据时，缺失部分按 0 计入，得到的是下界，所以加「≥」——
+    不能把「只统计了几件」的数字说成整餐精确值。
+    """
+    if not macros:
+        return ""
+    values = {key: round(float(macros.get(key) or 0), 1) for key in MACRO_LABEL}
+    if not any(values.values()):
+        # 一件都没有官方营养素时，下界全是 0，写「蛋白 ≥0g」只会像故障；留空更诚实
+        return ""
+    sign = "≥" if incomplete else ""
+    return "蛋白 %s%gg · 脂肪 %s%gg · 碳水 %s%gg" % (
+        sign,
+        values["protein"],
+        sign,
+        values["fat"],
+        sign,
+        values["carbohydrate"],
+    )
+
+
+def _explain_blocker(
+    items: list[dict],
+    parsed: dict,
+    mode: str,
+    *,
+    lightest: dict | None = None,
+    cheapest: dict | None = None,
+    real_yuan: float | None = None,
+) -> dict:
+    """无可行组合时说清主要阻碍，不擅自放宽（PRD 规则 10、场景六）。
+
+    只用真实生成过的候选说话：之前拿"单个最轻商品"当解释，会出现
+    「最低 10.50 元，超出 5 元预算」这种自相矛盾的文案。
+    数字口径与方案一致——只讲方案自身，不叠加购物车已有商品。
+    """
+    kcal_limit = parsed["kcalLimit"]
+    budget = parsed["budget"]
+    usable = [it for it in items if (it.get("decision") or {}).get("allowed") is not False]
+    if not usable:
+        return {"code": "no-items", "message": "当前门店在该模式下没有可选餐品，请切换模式或换门店", "suggestions": []}
+
+    parts: list[str] = []
+    kcal_blocked = False
+    if kcal_limit is not None and lightest:
+        limit = float(kcal_limit["value"])
+        kcal = lightest["rawKcal"]
+        if (kcal_limit["inclusive"] and kcal > limit) or (not kcal_limit["inclusive"] and kcal >= limit):
+            kcal_blocked = True
+            parts.append(
+                "最轻的一组「%s」约 %d 千卡，已经%s %g 千卡的上限"
+                % (_rows_text(lightest["rows"]), round(kcal), "超过" if kcal > limit else "达到", limit)
+            )
+    budget_blocked = budget is not None and cheapest is not None
+    if budget_blocked:
+        limit = float(budget["value"])
+        total_yuan = real_yuan if real_yuan is not None else cheapest["rawPrice"]
+        if real_yuan is not None:
+            parts.append(
+                "最便宜的一组「%s」试算应付 %.2f 元，超出 %g 元预算"
+                % (_rows_text(cheapest["rows"]), total_yuan, limit)
+            )
+        else:
+            parts.append(
+                "最便宜的一组「%s」估算 %.2f 元，超出 %g 元预算"
+                % (_rows_text(cheapest["rows"]), total_yuan, limit)
+            )
+    # 营养素条件：单独给一条更具体的阻碍说明，否则只会落到「没找到同时满足的组合」
+    macro_limits = parsed.get("macroLimits") or {}
+    macro_blocked = False
+    if macro_limits and not parts:
+        macro_blocked = True
+        wanted = []
+        for key, limit in macro_limits.items():
+            if limit["min"]:
+                sign = "≥" if limit["inclusive"] else ">"
+            else:
+                sign = "≤" if limit["inclusive"] else "<"
+            wanted.append(f"{MACRO_LABEL[key]} {sign}{limit['value']:g}g")
+        parts.append(
+            "没有组合能同时满足%s；也有可能是部分商品缺官方营养素数据，无法判断是否达标"
+            % "、".join(wanted)
+        )
+
+    if not parts:
+        parts.append("按当前条件没有找到同时满足的组合")
+
+    # 建议只给真正构成阻碍的放宽方向，避免"热量没超限却让你提高热量上限"
+    suggestions = [
+        "把热量上限提高到 %d 千卡以上" % round(lightest["rawKcal"]) if kcal_blocked else None,
+        "把预算放宽到 %.2f 元以上" % (real_yuan if real_yuan is not None else (cheapest or {}).get("rawPrice", 0))
+        if budget_blocked
+        else None,
+        "放宽蛋白质／脂肪／碳水的要求" if macro_blocked else None,
+        "减少必选餐品或去掉排除项",
+        "切换普通模式（减脂模式只保留汉堡与黑咖啡）" if mode == "lean" else None,
+    ]
+    return {"code": "no-match", "message": "；".join(parts), "suggestions": [s for s in suggestions if s]}
+
+
+# ---------- 3. 试算与装配 ----------
+
+
+def build_plans(
+    app: Any,
+    *,
+    store_code: str,
+    mode: str,
+    text: str,
+    cart: list[dict] | None = None,
+    skip: list[list[str]] | None = None,
+    need_tableware: bool = True,
+) -> dict:
+    """对外入口：解析 → 生成 → 逐个真实试算 → 输出最多 3 个方案。"""
+    menu = app.menu(store_code, mode)
+    items = menu["items"]
+    parsed = parse_request(text, items, mode)
+
+    locked = []
+    for row in cart or []:
+        code = str(row.get("code") or "")
+        qty = max(1, int(row.get("quantity") or 1))
+        match = next((it for it in items if it["code"] == code), None)
+        if not match:
+            continue
+        sauce_off = bool(row.get("sauceOff"))
+        kcal_obj = match.get("kcal") or {}
+        locked.append(
+            {
+                "code": code,
+                "name": match["name"],
+                "price": _unit_price(match),
+                "quantity": qty,
+                "kcal": _unit_kcal(match, sauce_off),
+                "sauceOff": sauce_off,
+                "kind": (match.get("decision") or {}).get("kind") or "other",
+                "locked": True,
+                # 套餐/无官方数据的商品用的是兜底值，不能让它冒充精确热量
+                "estimated": kcal_obj.get("source") != "official",
+            }
+        )
+    # 仅用于提示「购物车已有几件」，不参与方案的金额与热量计算
+    locked_kcal = sum(r["kcal"] * r["quantity"] for r in locked)
+    locked_price = sum(r["price"] * r["quantity"] for r in locked)
+    budget = parsed["budget"]
+
+    gen = generate(items, parsed, mode=mode, skip=skip, locked=locked)
+    if not gen.get("plans"):
+        # 无可行组合时，把几组候选真算一遍，用实价解释阻碍（不拿列表价/估算价当结论）。
+        # 不能只试「列表价最低」那一组：列表价不可信（燕麦奶铁 ¥9.9 实际 ¥27），
+        # 只试一组会得出「最便宜也要 41.50 元」，而实际另有 25.00 元的组合。
+        cheapest = gen.get("cheapest")
+        real_yuan = None
+        probes = _trial_order(gen.get("candidates") or [], BLOCKER_TRIALS)
+        trials: list[tuple[dict, float]] = []
+        for cand in probes:
+            # 配餐独立计价：只试算方案自身，不把购物车已有商品并进去
+            probe = [{"productCode": r["code"], "quantity": r["quantity"]} for r in cand["rows"]]
+            try:
+                res = coupons.select_best(
+                    app.require_client(),
+                    store_code=store_code,
+                    items=probe,
+                    need_tableware=need_tableware,
+                    budget=TRIAL_BUDGET,
+                )
+                cents = res.get("cents")
+                if isinstance(cents, int):
+                    trials.append((cand, round(cents / 100, 2)))
+            except Exception:  # noqa: BLE001 - 探价失败就跳过这组
+                continue
+        if trials:
+            cheapest, real_yuan = min(trials, key=lambda x: x[1])
+        blocker = _explain_blocker(
+            items,
+            parsed,
+            mode,
+            lightest=gen.get("lightest"),
+            cheapest=cheapest,
+            real_yuan=real_yuan,
+        )
+        notes = list(gen.get("downgrades") or []) + list(parsed["unresolved"])
+        return {
+            "ok": True,
+            "mode": mode,
+            "recognized": parsed["recognized"],
+            "unresolved": parsed["unresolved"],
+            "cartItems": locked,
+            "cartKcal": round(locked_kcal),
+            "cartPrice": round(locked_price, 2),
+            "cartEstimated": sum(1 for r in locked if r.get("estimated")),
+            "plans": [],
+            "blocker": blocker,
+            "note": "；".join(notes) if notes else None,
+            "estimatedCandidates": gen.get("totalCandidates"),
+        }
+
+    plans: list[dict] = []
+    trial_notes: list[str] = []
+    failed_trials: list[tuple[dict, float]] = []
+    seen_signatures: set[tuple] = set()
+
+    for cand in _trial_order(gen["plans"], MAX_TRIAL_CANDIDATES):
+        if len(plans) >= MAX_PLANS:
+            break
+        signature = tuple(sorted(r["code"] for r in cand["rows"]))
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        # 配餐独立计价：只把方案自身的餐品送去试算，不并入购物车已有商品
+        price_items = [{"productCode": r["code"], "quantity": r["quantity"]} for r in cand["rows"]]
+        # 减脂汉堡去酱要作为定制提交（PRD 已实测支持）
+        for idx, row in enumerate(cand["rows"]):
+            if row["sauceOff"]:
+                try:
+                    fact = app.facts_for(store_code, row["code"])
+                except Exception:  # noqa: BLE001 - 详情失败不该让整个配餐失败
+                    continue
+                values = []
+                for v in fact.get("values") or []:
+                    if not v.get("unselectedKey"):
+                        continue
+                    off = "酱" in (v.get("name") or "")
+                    values.append(
+                        {
+                            "code": v["code"],
+                            "key": v["unselectedKey"] if off else v.get("selectedKey"),
+                            "quantity": 0 if off else (v.get("selectedQuantity") or 1),
+                        }
+                    )
+                if values:
+                    price_items[idx]["modification"] = {"values": values}
+
+        try:
+            result = coupons.select_best(
+                app.require_client(),
+                store_code=store_code,
+                items=price_items,
+                need_tableware=need_tableware,
+                budget=TRIAL_BUDGET,
+            )
+        except Exception as exc:  # noqa: BLE001 - 试算失败要保留其他方案并说明
+            trial_notes.append(f"有一组方案试算失败：{exc}")
+            continue
+
+        cents = result.get("cents")
+        if not isinstance(cents, int):
+            trial_notes.append("有一组方案未拿到有效价格，已跳过")
+            continue
+        yuan = round(cents / 100, 2)
+        if result.get("note"):
+            trial_notes.append(result["note"])
+
+        if budget is not None:
+            limit = float(budget["value"])
+            if (budget["inclusive"] and yuan > limit) or (not budget["inclusive"] and yuan >= limit):
+                failed_trials.append((cand, yuan))  # 券后仍超预算，不展示；留作阻碍说明的依据
+                continue
+
+        # 方案自身热量，不含购物车
+        total_kcal = sum(r["kcal"] * r["quantity"] for r in cand["rows"])
+        plans.append(
+            {
+                "id": len(plans) + 1,
+                "items": cand["rows"],
+                "kcal": round(total_kcal),
+                "kcalText": f"约 {round(total_kcal)} 千卡",
+                # 三大营养素：缺数据的商品按 0 计入，所以是**下界**（部分商品无官方数据时标 ≥）
+                "macros": cand.get("macros"),
+                "macrosIncomplete": bool(cand.get("macroIncomplete")),
+                "macrosText": _macros_text(cand.get("macros"), bool(cand.get("macroIncomplete"))),
+                "cents": cents,
+                "yuan": yuan,
+                "coupon": result.get("couponTitle"),
+                "couponNote": result.get("note"),
+                "reason": _reason(cand["rows"], parsed, mode, result.get("couponTitle")),
+                "signature": [r["code"] for r in cand["rows"]],
+                # 有兜底估算项时明说，别让估算值看起来像官方数据（PRD US-02）
+                "hasEstimate": any(r.get("kcalSource") in ("heuristic", "unknown") for r in cand["rows"]),
+            }
+        )
+
+    # 券后价重排（PRD 规则 5：金额优先，其次热量，再次件数）
+    if "full" not in parsed["prefs"]:
+        plans.sort(key=lambda p: (p["yuan"], p["kcal"], len(p["items"])))
+    else:
+        plans.sort(key=lambda p: (-p["kcal"], p["yuan"], len(p["items"])))
+    for i, p in enumerate(plans, 1):
+        p["id"] = i
+
+    blocker = None
+    if not plans:
+        if failed_trials:
+            # 有候选但券后仍不达标：用真实试算价中最便宜的一组解释，避免猜测
+            cand, yuan = min(failed_trials, key=lambda x: x[1])
+            blocker = _explain_blocker(
+                items, parsed, mode, lightest=gen.get("lightest"), cheapest=cand, real_yuan=yuan
+            )
+            blocker["message"] = "找到 %d 组搭配，但%s，因此没有可推荐方案" % (
+                gen.get("totalCandidates") or len(gen["plans"]),
+                blocker.get("message") or "优惠后仍不满足条件",
+            )
+        else:
+            blocker = _explain_blocker(
+                items, parsed, mode, lightest=gen.get("lightest"), cheapest=gen.get("cheapest")
+            )
+
+    notes = []
+    if gen.get("downgrades"):
+        notes.extend(gen["downgrades"])
+    if trial_notes:
+        notes.extend(dict.fromkeys(trial_notes))
+    if parsed["unresolved"]:
+        notes.extend(parsed["unresolved"])
+    if gen.get("macroUncertain"):
+        notes.append(
+            "%d 组搭配因部分商品缺官方蛋白质/脂肪/碳水数据、无法确认是否达标，未纳入推荐"
+            % gen["macroUncertain"]
+        )
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "recognized": parsed["recognized"],
+        "unresolved": parsed["unresolved"],
+        "macroLimits": parsed.get("macroLimits") or {},
+        "cartItems": locked,
+        "cartKcal": round(locked_kcal),
+        "cartPrice": round(locked_price, 2),
+        "cartEstimated": sum(1 for r in locked if r.get("estimated")),
+        "plans": plans,
+        "blocker": blocker,
+        "note": "；".join(notes) if notes else None,
+        "estimatedCandidates": gen.get("totalCandidates"),
+    }
+
+
+def _reason(rows: list[dict], parsed: dict, mode: str, coupon_title: str | None) -> str:
+    bits = []
+    if parsed["must"]:
+        bits.append("含必选餐品")
+    if "cheap" in parsed["prefs"]:
+        bits.append("按更便宜优先")
+    elif "full" in parsed["prefs"]:
+        bits.append("在热量上限内尽量吃饱")
+    if coupon_title:
+        bits.append(f"已用券：{coupon_title}")
+    burgers = [r for r in rows if r["kind"] == "burger" and r["sauceOff"]]
+    if burgers:
+        bits.append(f"{len(burgers)} 个汉堡已去酱")
+    if not bits:
+        bits.append("%s内搭配" % ("减脂" if mode == "lean" else "当前门店"))
+    return "；".join(bits)
