@@ -1,6 +1,6 @@
 # 麦当劳点餐助手（Skill + H5）
 
-按 `docs/prd/PRD-001.md`（V1.20）实现。手机优先的 H5 + 共享业务层，业务口径全部来自 PRD 的 §1.4。
+按 `docs/prd/PRD-001.md`（V1.21）实现。手机优先的 H5 + 共享业务层，业务口径全部来自 PRD 的 §1.4。
 
 ## 目录
 
@@ -86,7 +86,7 @@ MCD_TOKEN=<token> python app/server.py
 ## 测试
 
 ```bash
-python tests/test_local.py                                  # 离线，52 项
+python tests/test_local.py                                  # 离线，56 项
 MCD_TOKEN=<token> python tests/smoke_live.py --city 郑州 --keyword 二七广场
 ```
 

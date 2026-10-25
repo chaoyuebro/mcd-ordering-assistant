@@ -54,7 +54,9 @@ SYSTEM_PROMPT = """你是麦当劳点餐需求解析器。把用户的一句话�
 - budget：预算上限，单位元。
 - people：用餐人数。counts：明确的份数（汉堡=main，饮品/咖啡=drink，小食/薯条=side）。
   people 与 counts 二选一：说了人数填 people，说了份数填 counts。
-- mustKeywords：用户点名想要的商品，用商品名中的连续片段（如「巨无霸」「麦香鱼」）。
+- mustKeywords：用户**点名**的具体商品，用商品名里的连续片段（如「巨无霸」「麦香鱼」）。
+  大类词（汉堡、咖啡、薯条、饮料、套餐）不是商品名：「要一个汉堡」填 counts.main，
+  不要填 mustKeywords；用户没点名任何商品时留空数组，禁止把菜单里的其他商品名塞进来。
 - excludeKeywords：用户明确不要的，包括口味（如「辣」「香菜」）和商品。
 - preferKeywords：用户偏好的口味或品类（如「牛肉」「鸡肉」「咖啡」「清淡」）。
 - prefs：仅当出现「便宜/省钱」填 cheap，「吃饱/管饱」填 full。

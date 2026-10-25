@@ -171,6 +171,7 @@ class TestLLMParsing(unittest.TestCase):
             mk("1440", "麦辣鸡腿汉堡", 22.5, 440, "burger"),
             mk("1450", "麦香鸡", 16.5, 324, "burger"),
             mk("1600", "麦香鱼", 22, 280, "burger"),
+            mk("1800", "牛肉汉堡", 24, 520, "burger"),
             mk("520689", "鲜萃咖啡", 10.5, 10, "coffee"),
         ]
 
@@ -230,6 +231,41 @@ class TestLLMParsing(unittest.TestCase):
             parsed, self.llm.normalize({"mustKeywords": ["麦香鱼"]}), self.items
         )
         self.assertIn("1600", merged["must"])
+
+    def test_llm_cannot_invent_must_products(self):
+        """回归：模型脑补必选商品必须被挡掉。
+
+        实测（门店 3560097）：模型把「一个汉堡一杯咖啡」脑补成 8 个必选套餐，
+        每个方案都塞进一整排，全部超预算，连续 5 次里 3 次直接无解。
+        """
+        text = "预算100元，要一个汉堡一杯咖啡"
+        parsed = self.planner.parse_request(text, self.items, "normal")
+        merged, _ = self.planner.merge_llm(
+            parsed,
+            self.llm.normalize({"mustKeywords": ["汉堡", "咖啡", "吉士汉堡包套餐"]}),
+            self.items,
+            text,
+        )
+        # 「吉士汉堡包套餐」用户没说过 → 接地规则丢掉；
+        # 「汉堡」命中多件 → 大类词，降级为口味偏好，不当必选；
+        # 「咖啡」只命中鲜萃咖啡一件 → 用户确实要一杯咖啡，可以必选
+        self.assertEqual(merged["must"], ["520689"])
+        self.assertIn("汉堡", merged.get("preferKeywords") or [])
+        gen = self.planner.generate(self.items, merged, mode="normal")
+        self.assertTrue(gen["plans"])
+        for c in gen["plans"]:
+            mains = [r for r in c["rows"] if r["kind"] in self.planner.MAIN_KINDS]
+            self.assertEqual(sum(r["quantity"] for r in mains), 1)  # 不能被塞成一整排
+
+    def test_must_keyword_needs_user_words(self):
+        """用户没点名过的商品，模型不能替他加必选（正则从原话识别的保留）。"""
+        text = "想要麦香鱼"
+        parsed = self.planner.parse_request(text, self.items, "lean")
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"mustKeywords": ["麦辣鸡腿汉堡"]}), self.items, text
+        )
+        self.assertNotIn("1440", merged["must"])  # 模型脑补的，丢掉
+        self.assertIn("1600", merged["must"])     # 用户原话点名的，保留
 
     def test_diet_hint_ignored(self):
         """「高蛋白／低脂／低碳水」这类健身向条件已下线，不再转成阈值。"""
@@ -446,6 +482,35 @@ class TestPlanner(unittest.TestCase):
         self.assertIn("A", p["exclude"])
         # 被排除的商品不能同时算必选
         self.assertNotIn("A", p["must"])
+
+    def test_must_capped_by_counts(self):
+        """同类必选超过用户要的份数时砍掉：必选占份数，不是加量。
+
+        用户说「要一个汉堡」又点了两个名，正则会都收进 must；超出的必须砍，
+        否则每个方案都被塞成两个汉堡（模型脑补场景的同源兜底）。
+        """
+        p = self.planner.parse_request("要一个汉堡，还要恰好堡和轻堡", self.items, "lean")
+        self.assertEqual(p["counts"]["main"], 1)
+        self.assertEqual(p["must"], ["A", "B"])  # 正则先都收下
+        gen = self.planner.generate(self.items, p, mode="lean")
+        self.assertTrue(gen["plans"])
+        for c in gen["plans"]:
+            mains = [r for r in c["rows"] if r["kind"] in self.planner.MAIN_KINDS]
+            self.assertEqual(sum(r["quantity"] for r in mains), 1)
+
+    def test_swap_exhausted_flags_skipped(self):
+        """「换一套」把候选全部排除后：plans 为空、candidates 为空、skipped 有数。
+
+        build_plans 靠这三个信号区分「看完了」和「没解」，给出不同文案。
+        """
+        p = self.planner.parse_request("要一个汉堡一杯咖啡", self.items, "normal")
+        gen = self.planner.generate(self.items, p, mode="normal")
+        self.assertTrue(gen["plans"])
+        skip = [[r["code"] for r in c["rows"]] for c in gen["plans"]]
+        gen2 = self.planner.generate(self.items, p, mode="normal", skip=skip)
+        self.assertFalse(gen2["plans"])
+        self.assertEqual(gen2.get("candidates"), [])
+        self.assertGreater(gen2["skipped"], 0)
 
     def test_same_item_count_merges_into_quantity(self):
         p = self.planner.parse_request("两个汉堡一杯咖啡", self.items, "lean")

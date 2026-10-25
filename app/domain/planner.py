@@ -296,7 +296,12 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
 # ---------- 1.5 合并模型解析结果 ----------
 
 
-def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[dict, list[str]]:
+def merge_llm(
+    parsed: dict,
+    llm_data: dict | None,
+    items: list[dict],
+    text: str = "",
+) -> tuple[dict, list[str]]:
     """把模型解析出的条件合并进正则结果，返回 (parsed, 本次新增的条件说明)。
 
     合并规则：**正则优先，模型只补空**。正则在数字与边界语义上更可靠（「不超过」含上限、
@@ -304,6 +309,9 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
 
     由模型带入的每一条都会写进 `recognized` 并标 `source=AI 解析`，用户看得见、能纠正。
     模型不产出任何价格/热量/营养素数值——那些仍由菜单与真实试算决定。
+
+    `text` 是用户原话，用于给模型的必选关键词「接地」：模型不能替用户点名他没说过的商品
+    （实测：模型把「一个汉堡一杯咖啡」脑补成 8 个必选套餐，每个方案都塞进一整排，直接超预算）。
     """
     if not llm_data:
         return parsed, []
@@ -376,9 +384,31 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
                 add("exclude", f"排除：{it['name']}（{keyword}）", it["code"])
     parsed["exclude"] = sorted(excluded)
 
+    # mustKeywords 落地三重防护（挡住模型脑补必选商品）：
+    # 1) 接地：关键词必须是用户原话里出现过的片段——模型不能替用户点名；
+    # 2) 展开：全名命中才必选；只命中一件也算说清了；命中多件的是大类词
+    #    （「汉堡」「咖啡」），当成必选会让每个方案都带上全部同名商品，
+    #    降级为口味偏好（让这类组合排前面），份数仍按用户说的算；
+    # 3) 同类必选总数不超过用户要的份数，见 generate()。
+    user_text = _clean_name(text or "")
     must: list[str] = list(parsed.get("must") or [])
+    deferred_prefs: list[str] = []
     for keyword in llm_data.get("mustKeywords") or []:
-        for it in match(keyword):
+        clean = _clean_name(keyword)
+        if not clean:
+            continue
+        if user_text and clean not in user_text:
+            continue  # 用户没点名过的商品，模型不能替他加必选
+        exact = [it for it in items if _clean_name(it["name"]) == clean]
+        partial = [it for it in items if clean in _clean_name(it["name"])]
+        if exact:
+            hits = exact
+        elif len(partial) == 1:
+            hits = partial  # 只匹配到一件，也算用户说清楚了
+        else:
+            deferred_prefs.append(keyword)
+            continue
+        for it in hits:
             if it["code"] in excluded or it["code"] in must:
                 continue
             must.append(it["code"])
@@ -394,7 +424,8 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
     parsed["prefs"] = prefs
 
     prefer: list[str] = list(parsed.get("preferKeywords") or [])
-    for keyword in llm_data.get("preferKeywords") or []:
+    # 大类词型的 mustKeywords 降级到这里：不强制必选，但让含这类商品的组合排前面
+    for keyword in deferred_prefs + (llm_data.get("preferKeywords") or []):
         if keyword not in prefer:
             prefer.append(keyword)
     if prefer:
@@ -503,16 +534,36 @@ def generate(
     drinks = [it for k in DRINK_KINDS for it in pool.get(k, []) if it["code"] not in excluded]
     sides = [it for k in SIDE_KINDS for it in pool.get(k, []) if it["code"] not in excluded]
 
-    # 必选项如果本身是主餐/饮品，先从对应池子里拿掉，避免重复计数
+    # 必选项如果本身是主餐/饮品，先从对应池子里拿掉，避免重复计数。
+    # 先按份数裁剪（must_items 定稿）再动池子：被砍掉的项要回到池子里当普通候选，
+    # 否则「要一个汉堡」遇到两个必选时，砍掉一个就连普通汉堡也没得选了。
     must_items = [by_code[c] for c in must_codes if c in by_code]
-    must_codes_set = {it["code"] for it in must_items}
-    mains = [it for it in mains if it["code"] not in must_codes_set]
-    drinks = [it for it in drinks if it["code"] not in must_codes_set]
-    sides = [it for it in sides if it["code"] not in must_codes_set]
 
     n_main = max(0, int(counts.get("main") or 0))
     n_drink = max(0, int(counts.get("drink") or 0))
     n_side = max(0, int(counts.get("side") or 0))
+    # 兜底：同类必选可能比用户要的份数还多（模型脑补或同名前缀命中多个套餐）。
+    # 必选是「占掉用户要的份数」，不是「再加量」——超出的部分砍掉，否则每个方案
+    # 都会被塞成一整排同名商品（实测：「一个汉堡一杯咖啡」被脑补成 8 个必选）。
+    # 用户没要这类时（份数为 0）不砍：点名就要，几个都认。
+    _kind_slot = {"main": MAIN_KINDS, "drink": DRINK_KINDS, "side": SIDE_KINDS}
+    _caps = {"main": n_main, "drink": n_drink, "side": n_side}
+    _used = {"main": 0, "drink": 0, "side": 0}
+    _kept: list[dict] = []
+    for it in must_items:
+        _kind = (it.get("decision") or {}).get("kind")
+        _slot = next((s for s, kinds in _kind_slot.items() if _kind in kinds), None)
+        if _slot and _caps[_slot] > 0:
+            if _used[_slot] >= _caps[_slot]:
+                continue
+            _used[_slot] += 1
+        _kept.append(it)
+    must_items = _kept
+
+    must_codes_set = {it["code"] for it in must_items}
+    mains = [it for it in mains if it["code"] not in must_codes_set]
+    drinks = [it for it in drinks if it["code"] not in must_codes_set]
+    sides = [it for it in sides if it["code"] not in must_codes_set]
     # 必选项已经占掉了主餐/饮品的位置
     buy_main = max(0, n_main - len([it for it in must_items if (it.get("decision") or {}).get("kind") in MAIN_KINDS]))
     buy_drink = max(0, n_drink - len([it for it in must_items if (it.get("decision") or {}).get("kind") in DRINK_KINDS]))
@@ -562,12 +613,20 @@ def generate(
     prefs = parsed["prefs"]
 
     all_candidates: list[dict] = []
+    skipped = 0  # 被「换一套」排除的组合数（只数估算价没过预算线的，用于「看完了」提示）
     for mg, dg, sg in itertools.product(main_groups, drink_groups, side_groups):
         chosen = list(must_items) + list(mg) + list(dg) + list(sg)
         if not chosen:
             continue
         codes = [it["code"] for it in chosen] + [c["code"] for c in locked]
+        # 预算先用估算价粗筛（留 15% 弹性，券后价可能更低）；换一套排除要在粗筛之后数，
+        # 否则「符合条件的 N 组都看过了」会把超预算的组合也数进去。
+        # 这里只算方案自身，不含购物车锁定项（配餐口径：价格与热量只算方案自身）。
+        raw_price = sum(_unit_price(by_code[it["code"]]) for it in chosen)
+        over_budget = budget is not None and raw_price > float(budget["value"]) * 1.15
         if frozenset(codes) in skip_sets:
+            if not over_budget:
+                skipped += 1
             continue
         # 同款出现多次要合并成数量，不能当成重复项丢掉
         qty_map: dict[str, int] = {}
@@ -596,12 +655,6 @@ def generate(
 
         # 配餐口径：方案自身的热量与金额独立计算，不叠加购物车已有商品
         raw_kcal = sum(r["kcal"] * r["quantity"] for r in rows)
-        raw_price = sum(r["price"] * r["quantity"] for r in rows)
-
-        # 预算先用估算价粗筛（留 15% 弹性，券后价可能更低）
-        over_budget = False
-        if budget is not None:
-            over_budget = raw_price > float(budget["value"]) * 1.15
 
         macro_low, _macro_high, macro_complete, _macro_unknown = _macro_bounds(rows)
 
@@ -646,12 +699,15 @@ def generate(
             "candidates": all_candidates,
             "totalCandidates": len(all_candidates),
             "downgrades": downgrades,
+            # 候选被「换一套」全部排除时为 0，skipped 记着看过几组，用于「看完了」提示
+            "skipped": skipped,
         }
 
     return {
         "plans": passed,
         "totalCandidates": len(passed),
         "downgrades": downgrades,
+        "skipped": skipped,
     }
 
 
@@ -851,7 +907,7 @@ def build_plans(
     if use_llm and (text or "").strip():
         raw_llm, llm_error = llm.parse_request(text, items)
         if raw_llm:
-            parsed, _added = merge_llm(parsed, llm.normalize(raw_llm), items)
+            parsed, _added = merge_llm(parsed, llm.normalize(raw_llm), items, text)
             ai_info.update(
                 {
                     "used": True,
@@ -892,6 +948,29 @@ def build_plans(
 
     gen = generate(items, parsed, mode=mode, skip=skip, locked=locked)
     if not gen.get("plans"):
+        # 「换一套」把候选全部看过的场景：不是没解，是看完了。说清楚，别让人误改条件
+        # （曾显示「没有找到符合条件的方案」，用户以为条件太严，其实只是看遍了）。
+        if skip and not gen.get("candidates") and int(gen.get("skipped") or 0) > 0:
+            notes = list(gen.get("downgrades") or []) + list(parsed["unresolved"])
+            return {
+                "ok": True,
+                "mode": mode,
+                "recognized": parsed["recognized"],
+                "unresolved": parsed["unresolved"],
+                "cartItems": locked,
+                "cartKcal": round(locked_kcal),
+                "cartPrice": round(locked_price, 2),
+                "cartEstimated": sum(1 for r in locked if r.get("estimated")),
+                "plans": [],
+                "blocker": {
+                    "code": "exhausted",
+                    "message": "符合条件的 %d 组搭配都已经看过了，换个条件再试，或重新生成" % int(gen["skipped"]),
+                    "suggestions": ["点「修改」调整已识别条件", "重新生成，从头再看一遍"],
+                },
+                "note": "；".join(notes) if notes else None,
+                "estimatedCandidates": 0,
+                "ai": ai_info,
+            }
         # 无可行组合时，把几组候选真算一遍，用实价解释阻碍（不拿列表价/估算价当结论）。
         # 不能只试「列表价最低」那一组：列表价不可信（燕麦奶铁 ¥9.9 实际 ¥27），
         # 只试一组会得出「最便宜也要 41.50 元」，而实际另有 25.00 元的组合。
