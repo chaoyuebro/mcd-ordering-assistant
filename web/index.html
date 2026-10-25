@@ -790,6 +790,8 @@
       const d = await api('/api/plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // 配餐 = 模型解析（3~6s）+ 多组真实试算，默认 20s 容易被误判超时
+        timeout: 60000,
         body: JSON.stringify({
           storeCode: state.store.storeCode,
           mode: state.mode,
