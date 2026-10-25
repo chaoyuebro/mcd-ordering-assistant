@@ -14,17 +14,17 @@ app/
     nutrition.py       # 热量计算（official / heuristic，去酱扣减、奶油球叠加）
     coupons.py         # 自动选券与试算（上限 8 次，遵守 PRD §1.4.6 顺序）
 web/index.html         # 单文件 H5（内联 CSS/JS，无外部依赖）
-.workbuddy/skills/
-  mcd-meal-planner/    # 配餐 Skill 包（SKILL.md + CLI + 接口口径）
 data/                  # 判定与营养数据（含实测快照）
 scripts/               # 一次性数据抓取/生成脚本
 tests/                 # 离线测试 + 真实只读冒烟
 docs/                  # PRD 与需求记录
 ```
 
+配餐 Skill 包（`.workbuddy/skills/mcd-meal-planner/`）已拆分为**独立仓库** `mcd-meal-planner`，不在本仓库内维护，避免两份口径漂移。
+
 ## Skill 包
 
-`.workbuddy/skills/mcd-meal-planner/` 是把智能配餐交给 Agent 调用的入口，项目级生效（放在工作区内即被加载）。
+配餐 Skill 包在独立仓库 `mcd-meal-planner`（本地仍位于 `.workbuddy/skills/mcd-meal-planner/`，项目级生效）。
 
 ```
 SKILL.md              # 触发条件、工作流、硬约束（不得编造数字、不得放宽条件）

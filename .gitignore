@@ -17,8 +17,10 @@ data/product-facts.json
 .env.*
 *.token
 
-# Agent 工作目录：记忆不入库，skill 交付物入库
-.workbuddy/memory/
+# Agent 工作目录：记忆与 Skill 包都不入本库
+# Skill 包已拆分为独立仓库（mcd-meal-planner），以嵌套 git 仓库形式放在
+# .workbuddy/skills/mcd-meal-planner/，在本库整体忽略，避免两份口径漂移
+.workbuddy/
 .playwright-cli/
 
 # 系统
