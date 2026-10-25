@@ -292,15 +292,15 @@
     load() {
       try {
         const raw = JSON.parse(localStorage.getItem('mcd.cart') || 'null');
-        if (raw && raw.store) { state.store = raw.store; state.mode = raw.mode || 'normal';
-          state.cart = (raw.cart || []).map(i => ({
-            ...i,
-            baseKcal: i.baseKcal != null ? i.baseKcal : (i.kcalUnit || 0),
-            sauceOff: !!i.sauceOff,
-            sauceAvailable: !!i.sauceAvailable,
-            fixedSauce: !!i.fixedSauce
-          }));
-          state.takeWay = raw.takeWay || null; return true; }
+        if (raw && raw.store) {
+          // 只恢复门店与模式：每次重新进入都从空购物车开始（用户要求），
+          // 避免上次没下单的餐品被悄悄带回来。
+          state.store = raw.store;
+          state.mode = raw.mode || 'normal';
+          state.cart = [];
+          state.takeWay = raw.takeWay || null;
+          return true;
+        }
       } catch (e) {}
       return false;
     }
@@ -545,12 +545,16 @@
     const sheetOpen = $('#cart-sheet').classList.contains('on') || $('#confirm-sheet').classList.contains('on');
     // 抽屉打开时隐藏页面底部购物车条，避免两条底栏叠在一起
     $('#cart-bar').classList.toggle('on', n > 0 && !sheetOpen);
+    // 空车不该显示「试算中…」——每次进入都是空车，那不是加载中
+    const priceText = n === 0
+      ? '¥0.00'
+      : (state.price ? '应付 ' + yuan(state.price.cents) : '试算中…');
     $('#bar-kcal').textContent = kcalText(cartKcal());
-    $('#bar-count').textContent = n + ' 件 · ' + (state.price ? '应付 ' + yuan(state.price.cents) : '试算中…');
+    $('#bar-count').textContent = n + ' 件 · ' + priceText;
     $('#bar-go').disabled = !state.price;
     // 抽屉里的底部同步同一份数字（不重复展示热量，热量在上方汇总区）
     $('#cart-count').textContent = n + ' 件';
-    $('#cart-total').textContent = state.price ? '应付 ' + yuan(state.price.cents) : '试算中…';
+    $('#cart-total').textContent = priceText;
   }
 
   let priceSeq = 0; // 试算请求序号：只接受最新一次结果，避免旧响应覆盖新购物车
@@ -911,7 +915,10 @@
   // 启动
   (async () => {
     await health();
-    if (store.load() && state.store) { await openMenu(); if (state.cart.length) refreshPrice(); }
+    if (store.load() && state.store) {
+      store.save();          // 把空购物车写回去，顺手清掉 localStorage 里的旧餐品
+      await openMenu();
+    }
   })();
 })();
 </script>
