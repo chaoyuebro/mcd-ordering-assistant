@@ -123,6 +123,7 @@
   .seg button.on{background:var(--yellow);border-color:var(--yellow);font-weight:600}
   .sumline{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:#444;font-variant-numeric:tabular-nums}
   .sumline.total{font-size:17px;font-weight:700;color:var(--ink);padding-top:10px}
+  .sumline.nutri{font-size:15px;font-weight:700;color:var(--ink)}
   .sumline .r{color:var(--red)}
   .sheet .foot{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);
     padding:10px 14px calc(10px + var(--safe-b));max-width:480px;margin:0 auto;display:flex;gap:10px;align-items:center}
@@ -518,6 +519,29 @@
   function cartCount() { return state.cart.reduce((s, i) => s + i.quantity, 0); }
   function unitPriceOf(it) { return Number(it.price) || 0; }
   function cartSubtotal() { return state.cart.reduce((s, i) => s + unitPriceOf(i) * i.quantity, 0); }
+  // 减脂模式整单营养合计（V1.22）：热量逐件相加；蛋白/脂肪/碳水只统计有官方数据的商品，
+  // 缺数据的不计入 → 合计是下界，用「≥」标注（沿用全站营养素口径，绝不拿估算顶替）
+  function cartNutrition() {
+    let kcal = 0, protein = 0, fat = 0, carb = 0, hasMacro = false, macroMissing = false;
+    for (const i of state.cart) {
+      if (i.quantity <= 0) continue;
+      kcal += unitKcalOf(i) * i.quantity;
+      if (i.macros) {
+        hasMacro = true;
+        protein += (Number(i.macros.protein) || 0) * i.quantity;
+        fat += (Number(i.macros.fat) || 0) * i.quantity;
+        carb += (Number(i.macros.carbohydrate) || 0) * i.quantity;
+      } else {
+        macroMissing = true;
+      }
+    }
+    const g = v => (macroMissing ? '≥' : '') + fmtG(v);
+    return {
+      kcalText: kcalText(kcal),
+      macroText: hasMacro ? `蛋白 ${g(protein)}g · 脂肪 ${g(fat)}g · 碳水 ${g(carb)}g` : '',
+      macroMissing,
+    };
+  }
   function money(n) { return '¥' + (Number(n) || 0).toFixed(2); }
 
   function renderCartBar() {
@@ -529,8 +553,8 @@
     const priceText = n === 0
       ? '¥0.00'
       : (state.price ? '应付 ' + yuan(state.price.cents) : '试算中…');
-    // 结算只报件数与金额，不再做热量加和（用户口径：下单页不看热量）
-    $('#bar-count').textContent = n + ' 件';
+    // 普通模式结算只报件数与金额；减脂模式（V1.22）在底栏补整单热量，营养素明细放抽屉里看
+    $('#bar-count').textContent = n + ' 件' + (n > 0 && state.mode === 'lean' ? ' · ' + cartNutrition().kcalText : '');
     $('#bar-sub').textContent = priceText;
     $('#bar-go').disabled = !state.price;
     $('#cart-count').textContent = n + ' 件';
@@ -580,8 +604,11 @@
     const payable = state.price ? (state.price.cents || 0) / 100 : null;
     // 无优惠时“商品小计”与“应付”是同一个数，只显示一次
     const showSubtotal = payable === null || Math.abs(payable - sub) > 0.005;
-    // 结算页只算钱：不做热量/营养素加和（用户口径）
+    // V1.22：减脂模式显示整单营养合计（热量 + 三大营养素下界）；普通模式维持「结算只算钱」
+    const nutri = state.mode === 'lean' && state.cart.length ? cartNutrition() : null;
     $('#cart-sum').innerHTML = `
+      ${nutri ? `<div class="sumline nutri"><span>整单合计</span><span>${nutri.kcalText}</span></div>
+      ${nutri.macroText ? `<div class="fine">${nutri.macroText}${nutri.macroMissing ? '（营养素为下界：部分商品无官方数据，未计入）' : ''}</div>` : ''}` : ''}
       ${showSubtotal ? `<div class="sumline"><span>商品小计</span><span>${money(sub)}</span></div>` : ''}`;
   }
 
@@ -648,6 +675,8 @@
     const ways = (state.price && state.price.takeWayList) || [];
     if (ways.length && !state.takeWay) state.takeWay = ways[ways.length - 1][0]; // 默认外带
     const p = state.price;
+    const n = state.mode === 'lean' && state.cart.length ? cartNutrition() : null;
+    const nutriRow = n ? `<div class="opt"><div class="k">整单营养<small>${n.kcalText}${n.macroText ? ' · ' + n.macroText : ''}${n.macroMissing ? '（营养素为下界）' : ''}</small></div></div>` : '';
     $('#confirm-body').innerHTML = `
       <div class="opt"><div class="k">门店<small>${esc(state.store.storeName)}</small></div></div>
       <div class="opt"><div class="k">取餐方式<small>到店自取</small></div>
@@ -657,6 +686,7 @@
         <div class="seg"><button class="on" data-tw="1">需要</button><button data-tw="0">不需要</button></div>
       </div>
       <div class="opt"><div class="k">餐品<small>${state.cart.map(i => esc(i.name) + ' ×' + i.quantity).join('、')}</small></div></div>
+      ${nutriRow}
       ${p ? `
         <div class="sumline"><span>商品金额</span><span>${yuan(p.breakdown.product)}</span></div>
         <div class="sumline"><span>打包 / 餐具</span><span>${yuan((p.breakdown.packing || 0) + (p.breakdown.tableware || 0))}</span></div>
