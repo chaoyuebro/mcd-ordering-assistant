@@ -12,10 +12,14 @@
 from __future__ import annotations
 
 import copy
+import time
 
 from ..mcp_client import MCDClient, MCDError
 
 MAX_TRIALS = 8
+# 单次选券的总时长上限（秒）。每张券都要调一次门店试算，接口一慢就会「试算中…」
+# 卡到天荒地老；超过上限就用已试出的最优结果收尾，并注明未穷举。
+DEADLINE_SECONDS = 25.0
 
 
 def _calc(client: MCDClient, store_code: str, be_type: int, order_type: int, items: list[dict], **extra) -> dict:
@@ -38,9 +42,12 @@ def select_best(
     order_type: int = 1,
     need_tableware: bool | None = None,
     budget: int = MAX_TRIALS,
+    deadline_seconds: float = DEADLINE_SECONDS,
 ) -> dict:
     """items: [{"productCode","quantity",...}]；返回应付最低方案与比较过程。"""
     extra = {} if need_tableware is None else {"needTableware": need_tableware}
+    started = time.monotonic()
+    timed_out = False
 
     baseline = _calc(client, store_code, be_type, order_type, items, **extra)
     best = {
@@ -73,6 +80,9 @@ def select_best(
 
     for coupon in coupons:
         if tried >= budget:
+            break
+        if deadline_seconds and time.monotonic() - started > deadline_seconds:
+            timed_out = True
             break
         applicable = {p.get("productCode") for p in (coupon.get("products") or []) if p.get("productCode")}
         idx = next(
@@ -113,6 +123,8 @@ def select_best(
         )
     if tried >= budget:
         note += "；已达试算上限，未穷举全部组合"
+    elif timed_out:
+        note += "；已用 %.0f 秒完成 %d 次试算，剩余券未比较" % (time.monotonic() - started, tried)
 
     return {
         **best,

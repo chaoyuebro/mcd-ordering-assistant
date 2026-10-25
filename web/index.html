@@ -300,14 +300,31 @@
   };
 
   async function api(path, opts) {
-    const res = await fetch(path, opts);
-    const data = await res.json().catch(() => ({ ok: false, message: '返回不是 JSON' }));
-    if (!res.ok || data.ok === false) {
-      const err = new Error(data.message || ('HTTP ' + res.status));
-      err.state = data.state || (res.status === 401 ? '连接失效' : '查询失败');
-      throw err;
+    // 一定要有超时：试算会串行比较多张券，网络一慢就永远停在「试算中…」，
+    // 用户既不知道在等什么也没法重试（实测踩过）。
+    const options = opts || {};
+    const ms = options.timeout || 20000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      const res = await fetch(path, { ...options, signal: ctrl.signal });
+      const data = await res.json().catch(() => ({ ok: false, message: '返回不是 JSON' }));
+      if (!res.ok || data.ok === false) {
+        const err = new Error(data.message || ('HTTP ' + res.status));
+        err.state = data.state || (res.status === 401 ? '连接失效' : '查询失败');
+        throw err;
+      }
+      return data;
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const err = new Error('等了 ' + Math.round(ms / 1000) + ' 秒没有结果，可能网络或门店接口太慢');
+        err.state = '超时';
+        throw err;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    return data;
   }
 
   function show(id) {
@@ -537,6 +554,7 @@
     try {
       const data = await api('/api/price', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
+        timeout: 45000, // 试算要逐张券比较，给足时间；超时也要能看到原因
         body: JSON.stringify({
           storeCode: state.store.storeCode, needTableware: true,
           items: state.cart.map(i => ({
@@ -550,12 +568,17 @@
       $('#price-note').style.display = data.couponError ? 'block' : 'none';
       $('#price-note').className = 'banner';
       $('#price-note').textContent = data.couponError ? '优惠暂未确认：' + data.couponError : '';
+      $('#price-note').onclick = null;
+      $('#price-note').style.cursor = '';
     } catch (e) {
       if (seq !== priceSeq) return;
       state.price = null;
       $('#price-note').style.display = 'block';
       $('#price-note').className = 'banner err';
-      $('#price-note').textContent = (e.state || '试算失败') + '：' + e.message;
+      $('#price-note').textContent = (e.state || '试算失败') + '：' + e.message + '（点此重试）';
+      // 失败后给一个明确的重试入口，不让用户干等或重刷整页
+      $('#price-note').style.cursor = 'pointer';
+      $('#price-note').onclick = () => refreshPrice();
     }
     renderCartBar();
     if ($('#cart-sheet').classList.contains('on')) renderCartSummary();
@@ -698,11 +721,16 @@
     const aiInfo = ai.used
       ? `<div class="ai-tip">AI 理解：${esc(ai.summary || '已完成解析')}</div>`
       : '';
+    // 没启用时也要说清楚，否则用户会以为「智能功能坏了」而一直重试
+    const aiWarn = (!ai.used && ai.error)
+      ? `<div class="fine">未启用智能解析（${esc(ai.error)}），当前按关键词规则识别</div>`
+      : '';
     $('#plan-cond').innerHTML = `
       <div class="cond">
         <div class="head"><b>已识别条件</b><span class="link" id="plan-edit">修改</span></div>
         <div class="tags">${tags || '<span class="fine">没识别到条件，将按当前模式的常规搭配生成</span>'}</div>
         ${aiInfo}
+        ${aiWarn}
         ${lockInfo}
       </div>`;
     const edit = $('#plan-edit');
