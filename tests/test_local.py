@@ -323,6 +323,21 @@ class TestLLMParsing(unittest.TestCase):
         picked = self.planner._trial_order(candidates, 4)
         self.assertEqual({len(c["rows"]) for c in picked}, {1, 2, 3, 4})
 
+    def test_trial_order_keeps_same_items_different_quantity(self):
+        """同款不同份数不能当重复：A+B 与 A+B×2 是两个不同方案。
+
+        原实现只按商品编码去重，导致 3 个、4 个汉堡的组合（大多是「某个 ×2」）
+        被当成 2 个的重复项丢掉，用户看到永远是 2 个汉堡。
+        """
+        def row(code, qty):
+            return {"code": code, "name": code, "quantity": qty, "kind": "burger"}
+
+        two = {"rows": [row("A", 1), row("B", 1)], "rawPrice": 30, "rawKcal": 600, "count": 2}
+        three = {"rows": [row("A", 1), row("B", 2)], "rawPrice": 45, "rawKcal": 900, "count": 3}
+        picked = self.planner._trial_order([two, three], 2)
+        self.assertEqual(len(picked), 2, "同款不同份数被错误去重")
+        self.assertEqual({c["count"] for c in picked}, {2, 3})
+
     def test_prefer_keyword_changes_order_not_filter(self):
         parsed = self.planner.parse_request("想吃鱼", self.items, "lean")
         merged, _ = self.planner.merge_llm(

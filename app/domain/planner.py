@@ -19,12 +19,16 @@ from typing import Any
 from .. import llm
 from . import coupons, nutrition
 
-# 展示方案上限（PRD 规则 5）
-MAX_PLANS = 3
+# 展示方案上限：条件宽松（可组合的候选多）时给到 6 个，条件紧时保持 3 个，
+# 避免为了凑数量做无谓的试算，也让手机上的列表不至于太长（PRD 规则 5）
+MAX_PLANS = 6
+NARROW_PLANS = 3
+# 通过初筛的候选超过这个数，说明约束比较松，值得多给几个方案
+WIDE_CANDIDATE_THRESHOLD = 12
 # 组合枚举上限，防止门店菜单特别大时炸掉
 MAX_CANDIDATES = 600
 # 初筛后最多试算几个候选（每个候选还会内部比较券，见 coupons.MAX_TRIALS）
-MAX_TRIAL_CANDIDATES = 12
+MAX_TRIAL_CANDIDATES = 16
 # 无解时为了给出可信的最低实价，最多多试几组（列表价不可信）
 BLOCKER_TRIALS = 6
 # 单个候选的试算预算（含无券基线），控制整个配餐请求的耗时
@@ -768,13 +772,20 @@ def generate(
 
 
 def _combo_pool(pool: list[dict], n: int, max_out: int = MAX_CANDIDATES) -> list[list[dict]]:
-    """按份数取组合：n=0 → 空；n=1 → 每个单品；n≥2 → 可重复组合（同款 ×2 也算）。"""
+    """按份数取组合：n=0 → 空；n=1 → 每个单品；n≥2 → 可重复组合（同款 ×2 也算）。
+
+    大份数（3、4 个汉堡）的组合数会爆炸，必须截断；但**不能按菜单原顺序截断**：
+    门店列表里前几个往往是芝士安格斯（696 千卡）、四件套（750 兜底）这类高热量的，
+    截断后 4 个的组合全在 2200 千卡以上，会被热量上限整批筛掉——实测「4 个汉堡」
+    一个都出不来就是这个原因。所以先按热量升序排，让可行的组合优先进入候选。
+    """
     if n <= 0:
         return [[]]
     if n == 1:
         return [[it] for it in pool]
+    ordered = sorted(pool, key=lambda it: float((it.get("kcal") or {}).get("unit") or 0))
     out = []
-    for combo in itertools.combinations_with_replacement(pool, n):
+    for combo in itertools.combinations_with_replacement(ordered, n):
         out.append(list(combo))
         if len(out) >= max_out:
             break
@@ -813,22 +824,27 @@ def _trial_order(candidates: list[dict], limit: int) -> list[dict]:
     seen: set[tuple] = set()
 
     def take(c: dict) -> None:
-        sig = tuple(sorted(r["code"] for r in c["rows"]))
+        # 去重必须带数量：同款「×1」与「×2」是不同的方案，
+        # 只按商品编码去重会把 3 个、4 个汉堡的组合当成 2 个的重复项丢掉。
+        sig = tuple(sorted((r["code"], int(r.get("quantity") or 1)) for r in c["rows"]))
         if sig in seen:
             return
         seen.add(sig)
         out.append(c)
 
-    # 0) 先按「总件数」分组，每组取列表价最低的一个：让「2 个汉堡」「3 个」「4 个」
-    #    都有机会被试算。份数没有弹性时这里只有一组，等于不做额外挑选。
+    # 0) 先按「总件数」分组，每组取列表价最低的两个：让「2 个汉堡」「3 个」「4 个」
+    #    都有机会被试算，且不止一个名额（否则补位阶段会被便宜的 2 个汉堡占满）。
+    #    份数没有弹性时这里只有一组，等于不做额外挑选。
     by_count: dict[int, list[dict]] = {}
     for c in candidates:
         n_items = c.get("count") or sum(int(r.get("quantity") or 1) for r in c["rows"])
         by_count.setdefault(n_items, []).append(c)
     for k in sorted(by_count):
-        if len(out) >= limit:
-            break
-        take(min(by_count[k], key=lambda c: (c["rawPrice"], c["rawKcal"])))
+        cheapest = sorted(by_count[k], key=lambda c: (c["rawPrice"], c["rawKcal"]))[:2]
+        for c in cheapest:
+            if len(out) >= limit:
+                break
+            take(c)
 
     # 1) 每种主餐各占 1 个名额，按该主餐最便宜的列表价升序
     for key in sorted(groups, key=lambda k: (groups[k][0]["rawPrice"], groups[k][0]["rawKcal"])):
@@ -965,7 +981,7 @@ def build_plans(
     need_tableware: bool = True,
     use_llm: bool = True,
 ) -> dict:
-    """对外入口：解析（正则 + 可选模型）→ 生成 → 逐个真实试算 → 输出最多 3 个方案。
+    """对外入口：解析（正则 + 可选模型）→ 生成 → 逐个真实试算 → 输出最多 6 个方案（条件宽松时多给几个，条件紧时 3 个）。
 
     模型只负责把口语翻成条件，翻出来的每一条都会回显给用户；价格与热量仍由
     菜单和真实试算决定。模型不可用（未配置 key / 超时 / 报错）时自动回退正则，
@@ -1075,10 +1091,13 @@ def build_plans(
     failed_trials: list[tuple[dict, float]] = []
     seen_signatures: set[tuple] = set()
 
+    # 条件宽松（候选多）时多给几个方案；条件紧时保持 3 个，不做无谓的试算
+    plan_cap = MAX_PLANS if (gen.get("totalCandidates") or 0) >= WIDE_CANDIDATE_THRESHOLD else NARROW_PLANS
     for cand in _trial_order(gen["plans"], MAX_TRIAL_CANDIDATES):
-        if len(plans) >= MAX_PLANS:
+        if len(plans) >= plan_cap:
             break
-        signature = tuple(sorted(r["code"] for r in cand["rows"]))
+        # 同款不同份数（×1 与 ×2）是两个方案，去重必须带数量
+        signature = tuple(sorted((r["code"], int(r.get("quantity") or 1)) for r in cand["rows"]))
         if signature in seen_signatures:
             continue
         seen_signatures.add(signature)
