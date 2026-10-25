@@ -237,7 +237,10 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
 
     # --- 数量约束 ---
     counts = {"main": 1, "drink": 1, "side": 0}
+    # explicit_counts 只表示「用户自己说了几份」。说不喝咖啡不是份数约束，
+    # 否则会挡掉「两个人」这类人数信息（实测：说「两个人…不要咖啡」只出 1 个汉堡）。
     explicit_counts = False
+    drink_off = False
     for m in re.finditer(r"(\d+|[一两二三四五六七八九十])\s*(?:个|份|杯|块|只)?\s*(汉堡|堡|主餐|套餐|咖啡|饮品|饮料|小食|薯条|鸡翅|可乐)", t):
         n = _cn2int(m.group(1))
         if n <= 0:
@@ -254,14 +257,14 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
             {"type": "count", "value": {word: n}, "label": f"{word} ×{n}", "source": m.group(0)}
         )
 
-    # 「只要一个汉堡」「不用饮料」这类，把饮品归零
+    # 「不用饮料」这类只关掉饮品，不动主餐份数
     if re.search(r"(不要|不用|不加|别要)\s*(?:饮料|饮品|咖啡|喝的)", t):
         counts["drink"] = 0
-        explicit_counts = True
+        drink_off = True
         recognized.append({"type": "count", "value": {"drink": 0}, "label": "不需要饮品", "source": "不要饮料"})
 
     # 减脂模式：至少要有主餐，且默认配一杯黑咖啡（这是该模式的常见形态，明示给用户）
-    if mode == "lean" and not explicit_counts:
+    if mode == "lean" and not explicit_counts and not drink_off:
         recognized.append(
             {
                 "type": "default",
@@ -301,6 +304,7 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
         "prefs": prefs,
         "counts": counts,
         "explicitCounts": explicit_counts,
+        "drinkOff": drink_off,
         "recognized": recognized,
         "unresolved": unresolved,
     }
@@ -341,17 +345,27 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
         parsed["budget"] = {"value": value, "inclusive": True, "text": "模型解析"}
         add("budget", f"预算 {value:g} 元（含上限）", value)
 
-    # 份数：人数按「每人 1 份主餐 + 1 杯饮品」折算，这是产品的默认结构，不是数据推断
+    # 份数：人数按「每人 1 份主餐 + 1 杯饮品」折算，这是产品的默认结构，不是数据推断。
+    # 用户已说「不要咖啡」时只折算主餐，饮品保持 0——否则会把「两个人」直接吞掉。
     if not parsed.get("explicitCounts"):
         counts = llm_data.get("counts") or {}
         people = llm_data.get("people")
+        drink_off = bool(parsed.get("drinkOff"))
         if people:
             n = min(max(int(people), 1), 3)
-            parsed["counts"] = {"main": n, "drink": n, "side": 0}
+            drink = 0 if drink_off else n
+            parsed["counts"] = {"main": n, "drink": drink, "side": 0}
             parsed["explicitCounts"] = True
-            add("count", f"{n} 人份：主餐 ×{n}、饮品 ×{n}", {"main": n})
+            label = f"{n} 人份：主餐 ×{n}" + ("、不含饮品" if drink == 0 else f"、饮品 ×{n}")
+            add("count", label, {"main": n})
         elif any(counts.get(k) for k in ("main", "drink", "side")):
-            merged = {k: min(int(counts.get(k) or 0), 3) for k in ("main", "drink", "side")}
+            base = dict(parsed.get("counts") or {})
+            merged = {
+                k: (min(int(counts[k]), 3) if counts.get(k) else int(base.get(k) or 0))
+                for k in ("main", "drink", "side")
+            }
+            if drink_off:
+                merged["drink"] = 0
             parsed["counts"] = merged
             parsed["explicitCounts"] = True
             label = "、".join(

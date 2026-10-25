@@ -243,6 +243,40 @@ class TestLLMParsing(unittest.TestCase):
         self.assertTrue(merged["macroLimits"]["protein"]["min"])
         self.assertTrue(any("高蛋白" in label for label in added))
 
+    def test_people_survives_drink_off(self):
+        """回归：说「两个人…不要咖啡」时，「不要咖啡」不能挡住人数折算。
+
+        原实现里「不要饮品」也置 explicitCounts=True，导致人数整条被跳过，
+        最终只配出 1 个汉堡（用户实测反馈）。
+        """
+        parsed = self.planner.parse_request("两个人，不要咖啡", self.items, "lean")
+        self.assertEqual(parsed["counts"]["drink"], 0)
+        self.assertFalse(parsed["explicitCounts"])
+        merged, added = self.planner.merge_llm(
+            parsed, self.llm.normalize({"people": 2, "excludeKeywords": ["咖啡"]}), self.items
+        )
+        self.assertEqual(merged["counts"], {"main": 2, "drink": 0, "side": 0})
+        self.assertTrue(merged["explicitCounts"])
+        self.assertTrue(any("不含饮品" in label for label in added))
+
+    def test_explicit_count_beats_people(self):
+        """用户自己说了「两个汉堡」时，人数不再覆盖份数。"""
+        parsed = self.planner.parse_request("两个汉堡，不要咖啡", self.items, "lean")
+        self.assertEqual(parsed["counts"]["main"], 2)
+        self.assertTrue(parsed["explicitCounts"])
+        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({"people": 3}), self.items)
+        self.assertEqual(merged["counts"]["main"], 2)
+        self.assertEqual(merged["counts"]["drink"], 0)
+
+    def test_partial_counts_keep_existing(self):
+        """模型只给了主餐份数时，不能把饮品份数清零。"""
+        parsed = self.planner.parse_request("随便", self.items, "lean")
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"counts": {"main": 2}}), self.items
+        )
+        self.assertEqual(merged["counts"]["main"], 2)
+        self.assertEqual(merged["counts"]["drink"], 1)
+
     def test_prefer_keyword_changes_order_not_filter(self):
         parsed = self.planner.parse_request("想吃鱼", self.items, "lean")
         merged, _ = self.planner.merge_llm(
