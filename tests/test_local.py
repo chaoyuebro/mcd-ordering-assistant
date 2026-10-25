@@ -205,15 +205,13 @@ class TestLLMParsing(unittest.TestCase):
         self.assertTrue(merged["explicitCounts"])
         self.assertTrue(any("2 人份" in label for label in added))
 
-    def test_regex_wins_over_model(self):
-        """正则已经解析出热量上限时，模型的数字不能覆盖它（临界值语义以原文为准）。"""
+    def test_kcal_never_becomes_condition(self):
+        """产品口径：配餐不再按热量筛选，正则与模型给的热量都不采纳。"""
         parsed = self.planner.parse_request("低于1000千卡", self.items, "lean")
-        self.assertFalse(parsed["kcalLimit"]["inclusive"])
-        merged, _ = self.planner.merge_llm(
-            parsed, self.llm.normalize({"kcalMax": 1200}), self.items
-        )
-        self.assertEqual(merged["kcalLimit"]["value"], 1000)
-        self.assertFalse(merged["kcalLimit"]["inclusive"])
+        self.assertIsNone(parsed["kcalLimit"])
+        self.assertTrue(any("不按热量筛" in u for u in parsed["unresolved"]))
+        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({"kcalMax": 1200}), self.items)
+        self.assertIsNone(merged["kcalLimit"])
 
     def test_taste_keyword_excludes_items(self):
         parsed = self.planner.parse_request("来点吃的", self.items, "lean")
@@ -233,15 +231,15 @@ class TestLLMParsing(unittest.TestCase):
         )
         self.assertIn("1600", merged["must"])
 
-    def test_diet_hint_maps_to_threshold(self):
-        """「高蛋白」这类词按与 H5 chip 相同的阈值落成条件，阈值写在标签里可核对。"""
+    def test_diet_hint_ignored(self):
+        """「高蛋白／低脂／低碳水」这类健身向条件已下线，不再转成阈值。"""
         parsed = self.planner.parse_request("想吃高蛋白的", self.items, "lean")
-        merged, added = self.planner.merge_llm(
+        merged, _ = self.planner.merge_llm(
             parsed, self.llm.normalize({"dietHints": ["highProtein"]}), self.items
         )
-        self.assertEqual(merged["macroLimits"]["protein"]["value"], 25.0)
-        self.assertTrue(merged["macroLimits"]["protein"]["min"])
-        self.assertTrue(any("高蛋白" in label for label in added))
+        self.assertEqual(merged["macroLimits"], {})
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        self.assertTrue(gen["plans"])
 
     def test_people_survives_drink_off(self):
         """回归：说「两个人…不要咖啡」时，「不要咖啡」不能挡住人数折算。
@@ -277,22 +275,17 @@ class TestLLMParsing(unittest.TestCase):
         self.assertEqual(merged["counts"]["main"], 2)
         self.assertEqual(merged["counts"]["drink"], 1)
 
-    def test_per_person_kcal_scaled_by_people(self):
-        """「每个人不超过1000千卡」是人均上限，全单要乘人数。"""
+    def test_kcal_does_not_filter_plans(self):
+        """热量条件（含「每人」口径）不再影响方案，人数照常折算。"""
         parsed = self.planner.parse_request("每个人不超过1000千卡，两个人，不要咖啡", self.items, "lean")
-        self.assertTrue(parsed["kcalLimit"]["perPerson"])
+        self.assertIsNone(parsed["kcalLimit"])
         merged, _ = self.planner.merge_llm(
             parsed, self.llm.normalize({"people": 2, "kcalMax": 1000, "kcalScope": "perPerson"}), self.items
         )
-        self.assertEqual(merged["kcalLimit"]["value"], 2000)
-        self.assertFalse(merged["kcalLimit"]["perPerson"])
-
-    def test_per_person_without_people_keeps_single(self):
-        """只说「每人1000千卡」但没说人数时，按单份上限算并给出提示。"""
-        parsed = self.planner.parse_request("每人不超过1000千卡", self.items, "lean")
-        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({}), self.items)
-        self.assertEqual(merged["kcalLimit"]["value"], 1000)
-        self.assertTrue(any("每人" in u for u in merged.get("unresolved") or []))
+        self.assertIsNone(merged["kcalLimit"])
+        self.assertEqual(merged["counts"]["main"], 2)
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        self.assertTrue(gen["plans"])
 
     def test_people_allows_more_than_one_main_each(self):
         """两个人时允许配 3~4 个汉堡：人均 1 个常常不够吃。"""
@@ -420,18 +413,14 @@ class TestPlanner(unittest.TestCase):
             mk("D", "拿铁", 15, 180, "coffee"),
         ]
 
-    def test_kcal_inclusive_accepts_boundary(self):
+    def test_kcal_condition_ignored(self):
+        """热量条件不再参与筛选：说了也不影响候选，只留一条提示。"""
         p = self.planner.parse_request("不超过1000千卡", self.items, "lean")
-        self.assertEqual(p["kcalLimit"]["value"], 1000)
-        self.assertTrue(p["kcalLimit"]["inclusive"])
+        self.assertIsNone(p["kcalLimit"])
+        self.assertTrue(any("不按热量筛" in u for u in p["unresolved"]))
         gen = self.planner.generate(self.items, p, mode="lean")
-        self.assertTrue(any(c["rawKcal"] == 1000 for c in gen["plans"]))
-
-    def test_kcal_exclusive_rejects_boundary(self):
-        p = self.planner.parse_request("低于1000千卡", self.items, "lean")
-        self.assertFalse(p["kcalLimit"]["inclusive"])
-        gen = self.planner.generate(self.items, p, mode="lean")
-        self.assertFalse(any(c["rawKcal"] >= 1000 for c in gen["plans"]))
+        self.assertTrue(gen["plans"])
+        self.assertTrue(any(c["rawKcal"] >= 1000 for c in gen["plans"]), "热量不应再过滤候选")
 
     def test_no_limit_when_not_mentioned(self):
         p = self.planner.parse_request("要一个汉堡一杯咖啡", self.items, "lean")
@@ -468,16 +457,18 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(total_qty, 3)  # 2 个汉堡 + 1 杯咖啡，不能被去重成 2 件
 
     def test_blocker_uses_real_candidate_not_single_item(self):
-        # 单个最轻商品是 10 千卡，但组合最轻是 310，阻碍说明必须用后者
-        p = self.planner.parse_request("不超过200千卡", self.items, "lean")
+        # 单个最便宜商品是 10 元（美式），但组合最便宜是 28 元，阻碍说明必须用后者
+        p = self.planner.parse_request("预算5元", self.items, "lean")
         gen = self.planner.generate(self.items, p, mode="lean")
         self.assertFalse(gen["plans"])
-        self.assertIsNotNone(gen["lightest"])
-        self.assertGreater(gen["lightest"]["rawKcal"], 200)
+        self.assertIsNotNone(gen["cheapest"])
+        self.assertGreater(gen["cheapest"]["rawPrice"], 5)
         blocker = self.planner._explain_blocker(
-            self.items, p, "lean", lightest=gen["lightest"], cheapest=gen["cheapest"]
+            self.items, p, "lean", cheapest=gen["cheapest"]
         )
-        self.assertIn("310", blocker["message"] + "".join(blocker["suggestions"]))
+        msg = blocker["message"] + "".join(blocker["suggestions"])
+        self.assertIn("28", msg)
+        self.assertNotIn("10.00", msg)  # 不能拿单个最便宜商品当组合结论
 
     def test_cart_does_not_add_to_plan_totals(self):
         """配餐的价格和热量只算方案自身，不与购物车相加（2026-10-24 用户拍板）。"""
@@ -496,12 +487,14 @@ class TestPlanner(unittest.TestCase):
         回归背景：曾把 760（购物车）+335（新增）=1095 写成一句话，用户读成
         「麦香鱼+咖啡=1095」。现在配餐独立计算，文案里不该再有购物车数字。
         """
-        p = self.planner.parse_request("不超过200千卡", self.items, "lean")
+        p = self.planner.parse_request("预算5元", self.items, "lean")
         locked = [{"code": "A", "name": "恰好堡", "quantity": 1, "kcal": 990, "price": 20}]
         gen = self.planner.generate(self.items, p, mode="lean", locked=locked)
-        self.assertFalse(gen.get("plans"))  # 最轻 310 也超 200
-        msg = self.planner._explain_blocker(self.items, p, "lean", lightest=gen["lightest"])["message"]
-        self.assertIn("最轻的一组", msg)
+        self.assertFalse(gen.get("plans"))  # 最便宜的一组 28 元也超 5 元
+        msg = self.planner._explain_blocker(
+            self.items, p, "lean", cheapest=gen["cheapest"]
+        )["message"]
+        self.assertIn("最便宜的一组", msg)
         self.assertNotIn("购物车", msg)
         self.assertNotIn("已选", msg)
         self.assertNotIn("合计", msg)
@@ -552,45 +545,22 @@ class TestPlanner(unittest.TestCase):
             "decision": {"kind": kind, "allowed": True},
         }
 
-    def test_macro_min_parsing(self):
-        p = self.planner.parse_request("蛋白质25g以上", self.items, "normal")
-        limit = p["macroLimits"]["protein"]
-        self.assertEqual(limit["value"], 25.0)
-        self.assertTrue(limit["min"])
-        self.assertTrue(limit["inclusive"])
+    def test_macro_conditions_ignored(self):
+        """营养素条件已下线：解析到也只给提示，不进筛选条件。"""
+        p = self.planner.parse_request("蛋白质25g以上，脂肪低于15g", self.items, "normal")
+        self.assertEqual(p["macroLimits"], {})
+        self.assertTrue(any("不按营养素筛" in u for u in p["unresolved"]))
 
-    def test_macro_max_exclusive_parsing(self):
-        """「低于15g」不含 15，与热量口径一致。"""
-        p = self.planner.parse_request("脂肪低于15g", self.items, "normal")
-        limit = p["macroLimits"]["fat"]
-        self.assertFalse(limit["min"])
-        self.assertFalse(limit["inclusive"])
-
-    def test_macro_filter_survives_missing_data(self):
-        """饮品没官方营养素时不能把整批方案毙掉——用热量推上界判断脂肪。
-
-        回归背景：曾经一律按「缺数据=无法判断」排除，导致「脂肪20g以内」
-        在减脂模式下全部无解（黑咖啡没有官方营养素条目）。
-        """
-        items = [
-            self._macro_item("H1", "瘦堡", 20, 300, "burger", {"protein": 30.0, "fat": 10.0, "carbohydrate": 30.0}),
-            self._macro_item("C1", "鲜萃咖啡", 10, 10, "coffee", None),
-        ]
-        p = self.planner.parse_request("脂肪20g以内，一个汉堡一杯咖啡", items, "normal")
-        gen = self.planner.generate(items, p, mode="normal")
-        self.assertTrue(gen["plans"], "咖啡缺数据不应导致无解")
-
-    def test_macro_min_filter_excludes_low_protein(self):
+    def test_macro_no_longer_filters_items(self):
+        """曾经「蛋白质25g以上」会排除低蛋白汉堡，现在不再排除。"""
         items = [
             self._macro_item("L1", "低蛋白堡", 20, 300, "burger", {"protein": 10.0, "fat": 10.0, "carbohydrate": 30.0}),
             self._macro_item("H2", "高蛋白堡", 22, 320, "burger", {"protein": 30.0, "fat": 12.0, "carbohydrate": 30.0}),
-            self._macro_item("C1", "鲜萃咖啡", 10, 10, "coffee", None),
         ]
-        p = self.planner.parse_request("蛋白质25g以上，一个汉堡一杯咖啡", items, "normal")
+        p = self.planner.parse_request("蛋白质25g以上", items, "normal")
         gen = self.planner.generate(items, p, mode="normal")
         names = [r["name"] for c in gen["plans"] for r in c["rows"]]
-        self.assertIn("高蛋白堡", names)
-        self.assertNotIn("低蛋白堡", names)
+        self.assertIn("低蛋白堡", names)
 
     def test_macro_upper_bound_is_energy_derived(self):
         """缺数据的商品：脂肪上界 ≤ 热量/9，蛋白/碳水 ≤ 热量/4。"""

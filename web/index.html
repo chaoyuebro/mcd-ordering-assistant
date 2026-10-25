@@ -148,7 +148,6 @@
   .cond .tag{background:#EAF3FF;color:#1A4E8A}
   .cond .tag.must{background:#FFF0E6;color:#8A3D00}
   .cond .tag.pref{background:#EAF7EC;color:#1D6B2C}
-  .cond .tag.macro{background:#F1ECFF;color:#4B2A8A}
   .cond .ai-tip{margin-top:8px;font-size:12px;line-height:1.5;color:#5F5F5F}
   .cond .ai-tip::before{content:"✦ ";color:#8A6D1F}
   .cond .locked{margin-top:8px;font-size:12px;color:#444;background:#FFF7E0;border-radius:8px;padding:8px 10px}
@@ -212,7 +211,7 @@
     </div>
     <div class="cartbar" id="cart-bar">
       <div class="inner">
-        <div class="sum"><b id="bar-kcal">约 0 千卡</b><span id="bar-count">0 件</span></div>
+        <div class="sum"><b id="bar-count">0 件</b><span id="bar-sub"></span></div>
         <button class="go" id="bar-go" disabled>去结算</button>
       </div>
     </div>
@@ -256,15 +255,12 @@
       <input id="plan-text" placeholder="人数、预算、口味与饮食偏好，如：两个人，不吃辣，预算60" autocomplete="off">
     </div>
     <div class="chips" id="plan-chips">
-      <button class="chip" data-fill="不超过1000千卡">≤1000千卡</button>
       <button class="chip" data-fill="预算40元以内">预算40元</button>
       <button class="chip" data-fill="一个汉堡一杯咖啡">汉堡+咖啡</button>
-      <button class="chip" data-fill="蛋白质25g以上">高蛋白</button>
-      <button class="chip" data-fill="脂肪15g以内">低脂</button>
-      <button class="chip" data-fill="碳水40g以内">低碳水</button>
       <button class="chip" data-fill="便宜点">更便宜</button>
       <button class="chip" data-fill="要吃饱">吃饱</button>
       <button class="chip" data-fill="两个人">两个人</button>
+      <button class="chip" data-fill="三个人">三个人</button>
       <button class="chip" data-fill="不吃辣">不吃辣</button>
     </div>
     <div id="plan-cond"></div>
@@ -520,22 +516,6 @@
   }
 
   function cartCount() { return state.cart.reduce((s, i) => s + i.quantity, 0); }
-  function cartKcal() { return state.cart.reduce((s, i) => s + unitKcalOf(i) * i.quantity, 0); }
-  // 整餐三大营养素：只累加有官方数据的商品，覆盖不足时如实告知件数
-  function cartMacros() {
-    const sum = { protein: 0, fat: 0, carbohydrate: 0 };
-    let covered = 0, units = 0;
-    state.cart.forEach(i => {
-      units += i.quantity;
-      const m = i.macros;
-      if (!m) return;
-      covered += i.quantity;
-      sum.protein += m.protein * i.quantity;
-      sum.fat += m.fat * i.quantity;
-      sum.carbohydrate += m.carbohydrate * i.quantity;
-    });
-    return { sum, covered, units };
-  }
   function unitPriceOf(it) { return Number(it.price) || 0; }
   function cartSubtotal() { return state.cart.reduce((s, i) => s + unitPriceOf(i) * i.quantity, 0); }
   function money(n) { return '¥' + (Number(n) || 0).toFixed(2); }
@@ -549,10 +529,10 @@
     const priceText = n === 0
       ? '¥0.00'
       : (state.price ? '应付 ' + yuan(state.price.cents) : '试算中…');
-    $('#bar-kcal').textContent = kcalText(cartKcal());
-    $('#bar-count').textContent = n + ' 件 · ' + priceText;
+    // 结算只报件数与金额，不再做热量加和（用户口径：下单页不看热量）
+    $('#bar-count').textContent = n + ' 件';
+    $('#bar-sub').textContent = priceText;
     $('#bar-go').disabled = !state.price;
-    // 抽屉里的底部同步同一份数字（不重复展示热量，热量在上方汇总区）
     $('#cart-count').textContent = n + ' 件';
     $('#cart-total').textContent = priceText;
   }
@@ -600,12 +580,9 @@
     const payable = state.price ? (state.price.cents || 0) / 100 : null;
     // 无优惠时“商品小计”与“应付”是同一个数，只显示一次
     const showSubtotal = payable === null || Math.abs(payable - sub) > 0.005;
-    const mac = cartMacros();
+    // 结算页只算钱：不做热量/营养素加和（用户口径）
     $('#cart-sum').innerHTML = `
-      ${showSubtotal ? `<div class="sumline"><span>商品小计</span><span>${money(sub)}</span></div>` : ''}
-      <div class="sumline"><span>整餐估算</span><span>${kcalText(cartKcal())}</span></div>
-      ${mac.covered ? `<div class="sumline"><span>蛋白 / 脂肪 / 碳水</span><span>${fmtG(mac.sum.protein)} / ${fmtG(mac.sum.fat)} / ${fmtG(mac.sum.carbohydrate)} g</span></div>` : ''}
-      ${mac.covered && mac.covered < mac.units ? `<div class="fine">营养素只计有官方数据的 ${mac.covered}/${mac.units} 件</div>` : ''}`;
+      ${showSubtotal ? `<div class="sumline"><span>商品小计</span><span>${money(sub)}</span></div>` : ''}`;
   }
 
   function openCart() {
@@ -680,7 +657,6 @@
         <div class="seg"><button class="on" data-tw="1">需要</button><button data-tw="0">不需要</button></div>
       </div>
       <div class="opt"><div class="k">餐品<small>${state.cart.map(i => esc(i.name) + ' ×' + i.quantity).join('、')}</small></div></div>
-      <div class="opt"><div class="k">整餐热量<small>${kcalText(cartKcal())}</small></div></div>
       ${p ? `
         <div class="sumline"><span>商品金额</span><span>${yuan(p.breakdown.product)}</span></div>
         <div class="sumline"><span>打包 / 餐具</span><span>${yuan((p.breakdown.packing || 0) + (p.breakdown.tableware || 0))}</span></div>
@@ -700,7 +676,7 @@
 
   // ---------- 智能配餐（PRD US-03） ----------
   const planState = { seq: 0, skip: [], last: null, applying: false };
-  const TAG_CLASS = { must: 'must', exclude: '', pref: 'pref', macro: 'macro' };
+  const TAG_CLASS = { must: 'must', exclude: '', pref: 'pref' };
 
   function openPlan() {
     $('#plan-mode').textContent = state.mode === 'lean' ? '减脂模式' : '普通模式';
@@ -791,7 +767,7 @@
 
   async function runPlan(isSwap) {
     const text = ($('#plan-text').value || '').trim();
-    if (!text) { alert('先说一句你想吃什么，比如「不超过1000千卡，要一个汉堡一杯咖啡」'); return; }
+    if (!text) { alert('先说一句你想吃什么，比如「两个人，预算60，要一个汉堡一杯咖啡」'); return; }
     const seq = ++planState.seq;
     const btn = $('#btn-plan-run');
     btn.disabled = true;
