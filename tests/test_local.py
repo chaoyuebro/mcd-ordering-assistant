@@ -143,6 +143,128 @@ class TestLeanCategories(unittest.TestCase):
         self.assertEqual([c["kind"] for c in out], ["burger"])
 
 
+class TestLLMParsing(unittest.TestCase):
+    """模型只做「翻译」：输出条件 JSON，数值与商品编码仍由规则引擎决定。
+
+    这些用例不联网，直接喂模型可能返回的结构，验证合并与清洗逻辑。
+    """
+
+    def setUp(self):
+        from app import llm
+        from app.domain import planner
+
+        self.llm = llm
+        self.planner = planner
+
+        def mk(code, name, price, kcal, kind):
+            return {
+                "code": code,
+                "name": name,
+                "price": str(price),
+                "kcal": {"unit": kcal, "source": "official"},
+                "hasSauces": False,
+                "autoSauceRemoved": False,
+                "decision": {"kind": kind, "allowed": True},
+            }
+
+        self.items = [
+            mk("1440", "麦辣鸡腿汉堡", 22.5, 440, "burger"),
+            mk("1450", "麦香鸡", 16.5, 324, "burger"),
+            mk("1600", "麦香鱼", 22, 280, "burger"),
+            mk("520689", "鲜萃咖啡", 10.5, 10, "coffee"),
+        ]
+
+    def test_normalize_drops_invalid_values(self):
+        raw = {
+            "kcalMax": "1000",
+            "budget": -5,
+            "people": 2,
+            "counts": {"main": "3", "drink": 0},
+            "dietHints": ["highProtein", "随便写的"],
+            "prefs": ["cheap", "expensive"],
+            "mustKeywords": ["麦香鱼", 123, ""],
+            "summary": "两人份",
+        }
+        n = self.llm.normalize(raw)
+        self.assertEqual(n["kcalMax"], 1000.0)
+        self.assertIsNone(n["budget"])          # 负数当没提
+        self.assertEqual(n["people"], 2)
+        self.assertEqual(n["counts"]["main"], 3)
+        self.assertIsNone(n["counts"]["drink"])  # 0 当没提
+        self.assertEqual(n["dietHints"], ["highProtein"])
+        self.assertEqual(n["prefs"], ["cheap"])
+        self.assertEqual(n["mustKeywords"], ["麦香鱼"])
+
+    def test_people_becomes_counts(self):
+        parsed = self.planner.parse_request("两个人，随便吃", self.items, "lean")
+        self.assertFalse(parsed["explicitCounts"])
+        merged, added = self.planner.merge_llm(
+            parsed, self.llm.normalize({"people": 2, "summary": "两人份"}), self.items
+        )
+        self.assertEqual(merged["counts"], {"main": 2, "drink": 2, "side": 0})
+        self.assertTrue(merged["explicitCounts"])
+        self.assertTrue(any("2 人份" in label for label in added))
+
+    def test_regex_wins_over_model(self):
+        """正则已经解析出热量上限时，模型的数字不能覆盖它（临界值语义以原文为准）。"""
+        parsed = self.planner.parse_request("低于1000千卡", self.items, "lean")
+        self.assertFalse(parsed["kcalLimit"]["inclusive"])
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"kcalMax": 1200}), self.items
+        )
+        self.assertEqual(merged["kcalLimit"]["value"], 1000)
+        self.assertFalse(merged["kcalLimit"]["inclusive"])
+
+    def test_taste_keyword_excludes_items(self):
+        parsed = self.planner.parse_request("来点吃的", self.items, "lean")
+        merged, added = self.planner.merge_llm(
+            parsed, self.llm.normalize({"excludeKeywords": ["辣"]}), self.items
+        )
+        self.assertIn("1440", merged["exclude"])
+        self.assertTrue(any("排除" in label for label in added))
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        codes = {r["code"] for c in gen["plans"] for r in c["rows"]}
+        self.assertNotIn("1440", codes)
+
+    def test_must_keyword_maps_to_code(self):
+        parsed = self.planner.parse_request("随便配", self.items, "lean")
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"mustKeywords": ["麦香鱼"]}), self.items
+        )
+        self.assertIn("1600", merged["must"])
+
+    def test_diet_hint_maps_to_threshold(self):
+        """「高蛋白」这类词按与 H5 chip 相同的阈值落成条件，阈值写在标签里可核对。"""
+        parsed = self.planner.parse_request("想吃高蛋白的", self.items, "lean")
+        merged, added = self.planner.merge_llm(
+            parsed, self.llm.normalize({"dietHints": ["highProtein"]}), self.items
+        )
+        self.assertEqual(merged["macroLimits"]["protein"]["value"], 25.0)
+        self.assertTrue(merged["macroLimits"]["protein"]["min"])
+        self.assertTrue(any("高蛋白" in label for label in added))
+
+    def test_prefer_keyword_changes_order_not_filter(self):
+        parsed = self.planner.parse_request("想吃鱼", self.items, "lean")
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"preferKeywords": ["鱼"]}), self.items
+        )
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        self.assertTrue(gen["plans"])
+        # 命中偏好的方案排在最前，但便宜方案仍在候选里（偏好只调顺序不放宽条件）
+        first = {r["name"] for r in gen["plans"][0]["rows"]}
+        self.assertIn("麦香鱼", first)
+
+    def test_missing_key_falls_back(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MINIMAX_API_KEY", None)
+            data, err = self.llm.parse_request("两个人", self.items)
+        self.assertIsNone(data)
+        self.assertIn("MINIMAX_API_KEY", err)
+
+
 class TestNutrition(unittest.TestCase):
     def test_official_kcal_used(self):
         r = nutrition.estimate_item("1440", "麦辣鸡腿汉堡", "burger")

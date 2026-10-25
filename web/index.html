@@ -142,6 +142,8 @@
   .cond .tag.must{background:#FFF0E6;color:#8A3D00}
   .cond .tag.pref{background:#EAF7EC;color:#1D6B2C}
   .cond .tag.macro{background:#F1ECFF;color:#4B2A8A}
+  .cond .ai-tip{margin-top:8px;font-size:12px;line-height:1.5;color:#5F5F5F}
+  .cond .ai-tip::before{content:"✦ ";color:#8A6D1F}
   .cond .locked{margin-top:8px;font-size:12px;color:#444;background:#FFF7E0;border-radius:8px;padding:8px 10px}
   .cond .locked .sum{font-weight:600}
   .cond .locked .row{display:flex;justify-content:space-between;gap:8px;margin-top:4px;color:#6A5A2E;font-size:12px}
@@ -244,7 +246,7 @@
   <div class="panel">
     <h3>智能配餐 <span class="tag" id="plan-mode">普通模式</span></h3>
     <div class="search">
-      <input id="plan-text" placeholder="说说你想吃什么，如：不超过1000千卡，要一个汉堡一杯咖啡" autocomplete="off">
+      <input id="plan-text" placeholder="人数、预算、口味与饮食偏好，如：两个人，不吃辣，预算60" autocomplete="off">
     </div>
     <div class="chips" id="plan-chips">
       <button class="chip" data-fill="不超过1000千卡">≤1000千卡</button>
@@ -255,6 +257,8 @@
       <button class="chip" data-fill="碳水40g以内">低碳水</button>
       <button class="chip" data-fill="便宜点">更便宜</button>
       <button class="chip" data-fill="要吃饱">吃饱</button>
+      <button class="chip" data-fill="两个人">两个人</button>
+      <button class="chip" data-fill="不吃辣">不吃辣</button>
     </div>
     <div id="plan-cond"></div>
     <div id="plan-list"></div>
@@ -689,10 +693,16 @@
     const lockInfo = cart.length
       ? `<div class="locked">购物车已有 ${cart.reduce((s, i) => s + i.quantity, 0)} 件：${cart.map(i => esc(i.name) + '×' + i.quantity).join('、')}。配餐按独立一份计算，不会重复推荐</div>`
       : '';
+    // 模型解析结果回显：让用户看到「AI 是怎么理解我那句话的」，识别错了可以直接改
+    const ai = d.ai || {};
+    const aiInfo = ai.used
+      ? `<div class="ai-tip">AI 理解：${esc(ai.summary || '已完成解析')}</div>`
+      : '';
     $('#plan-cond').innerHTML = `
       <div class="cond">
         <div class="head"><b>已识别条件</b><span class="link" id="plan-edit">修改</span></div>
         <div class="tags">${tags || '<span class="fine">没识别到条件，将按当前模式的常规搭配生成</span>'}</div>
+        ${aiInfo}
         ${lockInfo}
       </div>`;
     const edit = $('#plan-edit');

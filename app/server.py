@@ -477,6 +477,9 @@ class Handler(BaseHTTPRequestHandler):
                         "taxonomyVersion": load_taxonomy().version,
                         "estimateReviewed": bool(load_estimate_params().get("reviewed")),
                         "factsCached": len(_facts),
+                        # 智能解析是可选能力：没配 key 时自动回退正则，不影响配餐
+                        "aiConfigured": bool(os.environ.get("MINIMAX_API_KEY", "").strip()),
+                        "aiModel": os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash"),
                     },
                 )
                 return
@@ -538,6 +541,7 @@ class Handler(BaseHTTPRequestHandler):
                         cart=body.get("cart") or [],
                         skip=body.get("skip") or [],
                         need_tableware=bool(body.get("needTableware", True)),
+                        use_llm=bool(body.get("useLLM", True)),
                     ),
                 )
                 return

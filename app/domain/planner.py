@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from typing import Any
 
+from .. import llm
 from . import coupons, nutrition
 
 # 展示方案上限（PRD 规则 5）
@@ -304,6 +306,130 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
     }
 
 
+# ---------- 1.5 合并模型解析结果 ----------
+
+
+def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[dict, list[str]]:
+    """把模型解析出的条件合并进正则结果，返回 (parsed, 本次新增的条件说明)。
+
+    合并规则：**正则优先，模型只补空**。正则在数字与边界语义上更可靠（「不超过」含上限、
+    「低于」不含），模型的价值在于人数、口味、饮食偏好这些正则覆盖不到的表述。
+
+    由模型带入的每一条都会写进 `recognized` 并标 `source=AI 解析`，用户看得见、能纠正。
+    模型不产出任何价格/热量/营养素数值——那些仍由菜单与真实试算决定。
+    """
+    if not llm_data:
+        return parsed, []
+
+    added: list[str] = []
+    grouped = parsed.setdefault("recognized", [])
+
+    def add(kind: str, label: str, value: Any = None) -> None:
+        grouped.append({"type": kind, "value": value, "label": label, "source": "AI 解析"})
+        added.append(label)
+
+    # 热量上限 / 预算：正则没抓到才用模型的
+    kcal = llm_data.get("kcalMax")
+    if parsed.get("kcalLimit") is None and kcal:
+        value = int(round(kcal))
+        parsed["kcalLimit"] = {"value": value, "inclusive": True, "text": "模型解析"}
+        add("kcalMax", f"热量上限 {value} 千卡（含上限）", value)
+
+    budget = llm_data.get("budget")
+    if parsed.get("budget") is None and budget:
+        value = float(budget)
+        parsed["budget"] = {"value": value, "inclusive": True, "text": "模型解析"}
+        add("budget", f"预算 {value:g} 元（含上限）", value)
+
+    # 份数：人数按「每人 1 份主餐 + 1 杯饮品」折算，这是产品的默认结构，不是数据推断
+    if not parsed.get("explicitCounts"):
+        counts = llm_data.get("counts") or {}
+        people = llm_data.get("people")
+        if people:
+            n = min(max(int(people), 1), 3)
+            parsed["counts"] = {"main": n, "drink": n, "side": 0}
+            parsed["explicitCounts"] = True
+            add("count", f"{n} 人份：主餐 ×{n}、饮品 ×{n}", {"main": n})
+        elif any(counts.get(k) for k in ("main", "drink", "side")):
+            merged = {k: min(int(counts.get(k) or 0), 3) for k in ("main", "drink", "side")}
+            parsed["counts"] = merged
+            parsed["explicitCounts"] = True
+            label = "、".join(
+                f"{name} ×{merged[key]}"
+                for key, name in (("main", "主餐"), ("drink", "饮品"), ("side", "小食"))
+                if merged[key]
+            )
+            add("count", label, merged)
+
+    # 营养素：下限来自 macroMin，上限来自 macroMax；已有正则条件的不覆盖
+    limits = parsed.setdefault("macroLimits", {})
+    for key, value in (llm_data.get("macroMin") or {}).items():
+        if value and key not in limits:
+            limits[key] = {"value": float(value), "min": True, "inclusive": True, "text": "模型解析"}
+            add("macro", f"{MACRO_LABEL[key]} ≥{value:g}g", {key: value})
+    for key, value in (llm_data.get("macroMax") or {}).items():
+        if value and key not in limits:
+            limits[key] = {"value": float(value), "min": False, "inclusive": True, "text": "模型解析"}
+            add("macro", f"{MACRO_LABEL[key]} ≤{value:g}g", {key: value})
+
+    # 饮食偏好词 → 与 H5 快捷 chip 同一套阈值（25 / 15 / 40）
+    for hint in llm_data.get("dietHints") or []:
+        spec = llm.DIET_HINTS.get(hint)
+        if not spec:
+            continue
+        key, kind, value, label = spec
+        if key in limits:
+            continue
+        limits[key] = {"value": value, "min": kind == "min", "inclusive": True, "text": "模型解析"}
+        sign = "≥" if kind == "min" else "≤"
+        add("macro", f"{label}（{MACRO_LABEL[key]} {sign}{value:g}g）", {key: value})
+
+    # 关键词 → 商品编码（模型只给关键词，编码由这里按真实菜单落）
+    def match(keyword: str) -> list[dict]:
+        clean = _clean_name(keyword)
+        if not clean:
+            return []
+        return [it for it in items if clean in _clean_name(it["name"])]
+
+    excluded: set[str] = set(parsed.get("exclude") or [])
+    for keyword in llm_data.get("excludeKeywords") or []:
+        for it in match(keyword):
+            if it["code"] not in excluded:
+                excluded.add(it["code"])
+                add("exclude", f"排除：{it['name']}（{keyword}）", it["code"])
+    parsed["exclude"] = sorted(excluded)
+
+    must: list[str] = list(parsed.get("must") or [])
+    for keyword in llm_data.get("mustKeywords") or []:
+        for it in match(keyword):
+            if it["code"] in excluded or it["code"] in must:
+                continue
+            must.append(it["code"])
+            add("must", f"必选：{it['name']}", it["code"])
+    parsed["must"] = must
+
+    prefs: list[str] = list(parsed.get("prefs") or [])
+    for pref in llm_data.get("prefs") or []:
+        if pref in prefs:
+            continue
+        prefs.append(pref)
+        add("pref", "偏好：更便宜" if pref == "cheap" else "偏好：尽量吃饱", pref)
+    parsed["prefs"] = prefs
+
+    prefer: list[str] = list(parsed.get("preferKeywords") or [])
+    for keyword in llm_data.get("preferKeywords") or []:
+        if keyword not in prefer:
+            prefer.append(keyword)
+    if prefer:
+        parsed["preferKeywords"] = prefer
+        add("pref", "口味偏好：" + "、".join(prefer), prefer)
+
+    summary = (llm_data.get("summary") or "").strip()
+    if summary:
+        parsed["aiSummary"] = summary
+    return parsed, added
+
+
 # ---------- 2. 组合生成 ----------
 
 
@@ -536,11 +662,21 @@ def generate(
         if not c["overKcal"] and not c["overBudget"] and not c["overMacro"]
     ]
 
-    # 排序：用户偏好优先，否则按估算价 → 热量 → 件数（PRD 规则 5 的并列取舍）
+    # 口味偏好（如「想吃牛肉」「喜欢鸡肉」）：命中的方案排前面，
+    # 但不越过热量/预算/营养素这些硬条件——偏好只调整顺序，不放宽筛选。
+    prefer = parsed.get("preferKeywords") or []
+
+    def prefer_rank(cand: dict) -> int:
+        if not prefer:
+            return 0
+        hits = sum(1 for r in cand["rows"] if any(k in _clean_name(r["name"]) for k in prefer))
+        return -hits
+
+    # 排序：口味偏好 → 用户偏好 → 估算价 → 热量 → 件数（PRD 规则 5 的并列取舍）
     if "full" in prefs:
-        passed.sort(key=lambda c: (-c["rawKcal"], c["rawPrice"], c["count"]))
+        passed.sort(key=lambda c: (prefer_rank(c), -c["rawKcal"], c["rawPrice"], c["count"]))
     else:
-        passed.sort(key=lambda c: (c["rawPrice"], c["rawKcal"], c["count"]))
+        passed.sort(key=lambda c: (prefer_rank(c), c["rawPrice"], c["rawKcal"], c["count"]))
 
     if not passed:
         return {
@@ -748,11 +884,32 @@ def build_plans(
     cart: list[dict] | None = None,
     skip: list[list[str]] | None = None,
     need_tableware: bool = True,
+    use_llm: bool = True,
 ) -> dict:
-    """对外入口：解析 → 生成 → 逐个真实试算 → 输出最多 3 个方案。"""
+    """对外入口：解析（正则 + 可选模型）→ 生成 → 逐个真实试算 → 输出最多 3 个方案。
+
+    模型只负责把口语翻成条件，翻出来的每一条都会回显给用户；价格与热量仍由
+    菜单和真实试算决定。模型不可用（未配置 key / 超时 / 报错）时自动回退正则，
+    不阻塞配餐。
+    """
     menu = app.menu(store_code, mode)
     items = menu["items"]
     parsed = parse_request(text, items, mode)
+
+    ai_info: dict[str, Any] = {"used": False, "model": None, "summary": "", "error": None}
+    if use_llm and (text or "").strip():
+        raw_llm, llm_error = llm.parse_request(text, items)
+        if raw_llm:
+            parsed, _added = merge_llm(parsed, llm.normalize(raw_llm), items)
+            ai_info.update(
+                {
+                    "used": True,
+                    "model": os.environ.get("MINIMAX_MODEL", llm.DEFAULT_MODEL),
+                    "summary": parsed.get("aiSummary") or "",
+                }
+            )
+        elif llm_error:
+            ai_info["error"] = llm_error
 
     locked = []
     for row in cart or []:
@@ -831,6 +988,7 @@ def build_plans(
             "blocker": blocker,
             "note": "；".join(notes) if notes else None,
             "estimatedCandidates": gen.get("totalCandidates"),
+            "ai": ai_info,
         }
 
     plans: list[dict] = []
@@ -971,6 +1129,7 @@ def build_plans(
         "blocker": blocker,
         "note": "；".join(notes) if notes else None,
         "estimatedCandidates": gen.get("totalCandidates"),
+        "ai": ai_info,
     }
 
 

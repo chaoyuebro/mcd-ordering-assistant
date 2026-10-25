@@ -48,6 +48,7 @@ pip install pyyaml
 
 # Windows PowerShell
 $env:MCD_TOKEN="<你的麦当劳 MCP token>"
+$env:MINIMAX_API_KEY="<MiniMax key>"   # 可选：不配则输入框退回关键词解析
 python app/server.py
 # Git Bash / macOS
 MCD_TOKEN=<token> python app/server.py
@@ -71,6 +72,7 @@ MCD_TOKEN=<token> python app/server.py
 - 自动选券试算（无券基线 → 适用券逐张试算 → 取最低，≤8 次）
 - 确认页：堂食/外带（`takeWayCode` 取当次试算返回）、餐具默认需要、金额明细
 - 购物车与门店本地持久化（localStorage）
+- **智能解析（可选）**：配餐输入框支持「人数、预算、口味与饮食偏好」的口语表达。接入 MiniMax `MiniMax-M3.1-Flash` 把整句翻成结构化条件，再按真实菜单落成商品。**模型只做翻译**——不产出价格/热量/营养素，也拿不到商品编码；正则优先、模型补空，每条 AI 条件都会在「已识别条件」里标出来。未配置 `MINIMAX_API_KEY` 时静默回退关键词解析
 - **智能配餐（US-03）**：`POST /api/plan`。自然语言提要求（热量上限、预算、蛋白质/脂肪/碳水、必选、排除、便宜/吃饱），生成 ≤3 个方案并逐组真实试算；支持「换一套」；价格与热量只算方案自身、不与购物车相加，购物车商品只用于「不重复推荐」；无解时用真实试算价说明阻碍（口径见 PRD §1.4.11）。
   营养素筛选按上下界判定：下限条件用下界、上限条件用热量反推的硬上界（脂肪 ≤ 热量/9，蛋白碳水 ≤ 热量/4），所以一杯没有官方数据的黑咖啡不会让整批方案无解
 
@@ -83,7 +85,7 @@ MCD_TOKEN=<token> python app/server.py
 ## 测试
 
 ```bash
-python tests/test_local.py                                  # 离线，39 项
+python tests/test_local.py                                  # 离线，47 项
 MCD_TOKEN=<token> python tests/smoke_live.py --city 郑州 --keyword 二七广场
 ```
 
