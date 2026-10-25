@@ -39,6 +39,7 @@ SYSTEM_PROMPT = """你是麦当劳点餐需求解析器。把用户的一句话�
 输出结构（没提到的字段必须为 null 或空数组，禁止猜测、禁止补默认值）：
 {
   "kcalMax": 数字或null,
+  "kcalScope": "perPerson" 或 "total" 或 null,
   "budget": 数字或null,
   "people": 数字或null,
   "counts": {"main": 数字或null, "drink": 数字或null, "side": 数字或null},
@@ -54,6 +55,7 @@ SYSTEM_PROMPT = """你是麦当劳点餐需求解析器。把用户的一句话�
 
 字段含义：
 - kcalMax：热量上限，单位千卡。**全单只允许一个值**：用户提到多个上限（如「一个人 1000、一个人 2000」）时取最严格的那个（最小值），并在 summary 里写明「按最严格上限执行」，不要假装能分别处理。
+- kcalScope：热量上限的口径。用户说「每个人 / 每人 / 人均 / 每位 不超过 N 千卡」时填 "perPerson"，否则填 "total"。只有 kcalMax 有值时才填。
 - budget：预算上限，单位元。
 - people：用餐人数。counts：明确的份数（汉堡=main，饮品/咖啡=drink，小食/薯条=side）。
   people 与 counts 二选一：说了人数填 people，说了份数填 counts。
@@ -212,6 +214,7 @@ def normalize(raw: dict) -> dict:
 
     return {
         "kcalMax": _positive(raw.get("kcalMax")),
+        "kcalScope": raw.get("kcalScope") if raw.get("kcalScope") in ("perPerson", "total") else None,
         "budget": _positive(raw.get("budget")),
         "people": _int(raw.get("people")),
         "counts": {

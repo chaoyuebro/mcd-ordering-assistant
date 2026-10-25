@@ -170,13 +170,21 @@ def parse_request(text: str, items: list[dict], mode: str) -> dict:
     kcal_limit = None
     got = _grab_limit(t, KCAL_UNIT)
     if got:
-        kcal_limit = {"value": int(got["value"]), "inclusive": got["inclusive"], "text": got["text"]}
+        # 「每个人/每人」是人均上限，全单上限要乘人数（人数可能由模型给出，稍后换算）
+        per_person = bool(re.search(r"(每个人|每人|每位|人均)", t))
+        kcal_limit = {
+            "value": int(got["value"]),
+            "inclusive": got["inclusive"],
+            "text": got["text"],
+            "perPerson": per_person,
+        }
+        scope = "每人" if per_person else ""
         recognized.append(
             {
                 "type": "kcalMax",
                 "value": kcal_limit["value"],
                 "inclusive": kcal_limit["inclusive"],
-                "label": f"热量上限 {kcal_limit['value']} 千卡（{'含' if kcal_limit['inclusive'] else '不含'}上限）",
+                "label": f"{scope}热量上限 {kcal_limit['value']} 千卡（{'含' if kcal_limit['inclusive'] else '不含'}上限）",
                 "source": got["text"],
             }
         )
@@ -336,8 +344,14 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
     kcal = llm_data.get("kcalMax")
     if parsed.get("kcalLimit") is None and kcal:
         value = int(round(kcal))
-        parsed["kcalLimit"] = {"value": value, "inclusive": True, "text": "模型解析"}
-        add("kcalMax", f"热量上限 {value} 千卡（含上限）", value)
+        per_person = llm_data.get("kcalScope") == "perPerson"
+        parsed["kcalLimit"] = {
+            "value": value,
+            "inclusive": True,
+            "text": "模型解析",
+            "perPerson": per_person,
+        }
+        add("kcalMax", f"{'每人' if per_person else ''}热量上限 {value} 千卡（含上限）", value)
 
     budget = llm_data.get("budget")
     if parsed.get("budget") is None and budget:
@@ -347,15 +361,21 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
 
     # 份数：人数按「每人 1 份主餐 + 1 杯饮品」折算，这是产品的默认结构，不是数据推断。
     # 用户已说「不要咖啡」时只折算主餐，饮品保持 0——否则会把「两个人」直接吞掉。
+    people = llm_data.get("people")
+    if people:
+        # 人数是「人均热量」换算的依据，即使份数由用户自己指定也要记下来
+        parsed["people"] = min(max(int(people), 1), 5)
     if not parsed.get("explicitCounts"):
         counts = llm_data.get("counts") or {}
-        people = llm_data.get("people")
         drink_off = bool(parsed.get("drinkOff"))
         if people:
-            n = min(max(int(people), 1), 3)
+            n = parsed["people"]
             drink = 0 if drink_off else n
             parsed["counts"] = {"main": n, "drink": drink, "side": 0}
             parsed["explicitCounts"] = True
+            # 只有「按人数折算」的份数才允许上浮：人均 1 个汉堡往往不够吃，
+            # 由 generate 在预算/热量允许时多配 1~2 个。用户自己说了份数则不浮动。
+            parsed["mainElastic"] = True
             label = f"{n} 人份：主餐 ×{n}" + ("、不含饮品" if drink == 0 else f"、饮品 ×{n}")
             add("count", label, {"main": n})
         elif any(counts.get(k) for k in ("main", "drink", "side")):
@@ -374,6 +394,29 @@ def merge_llm(parsed: dict, llm_data: dict | None, items: list[dict]) -> tuple[d
                 if merged[key]
             )
             add("count", label, merged)
+
+    # 人均热量上限 → 全单上限（人数确定后才能换算）
+    kcal_limit = parsed.get("kcalLimit")
+    if kcal_limit and kcal_limit.get("perPerson"):
+        n = parsed.get("people") or 0
+        if n > 1:
+            per = int(kcal_limit["value"])
+            total = per * n
+            kcal_limit["value"] = total
+            kcal_limit["perPerson"] = False
+            for entry in parsed.get("recognized") or []:
+                if entry.get("type") == "kcalMax" and str(per) in (entry.get("label") or ""):
+                    entry["label"] = (
+                        f"热量上限 {total} 千卡（每人 {per} × {n} 人，"
+                        f"{'含' if kcal_limit['inclusive'] else '不含'}上限）"
+                    )
+                    break
+        elif n == 1:
+            kcal_limit["perPerson"] = False
+        else:
+            parsed.setdefault("unresolved", []).append(
+                "「每人」的热量上限需要知道人数，当前按单份上限计算"
+            )
 
     # 营养素：下限来自 macroMin，上限来自 macroMax；已有正则条件的不覆盖
     limits = parsed.setdefault("macroLimits", {})
@@ -562,7 +605,18 @@ def generate(
     buy_main = max(0, n_main - len([it for it in must_items if (it.get("decision") or {}).get("kind") in MAIN_KINDS]))
     buy_drink = max(0, n_drink - len([it for it in must_items if (it.get("decision") or {}).get("kind") in DRINK_KINDS]))
 
-    main_groups = _combo_pool(mains, buy_main)
+    # 人均 1 个汉堡常常不够吃（用户实测反馈：两个人各配 1 个太少了）。
+    # 只有在「份数由人数折算」时才允许上浮 1~2 个，多出来的部分由热量与预算自然裁剪；
+    # 用户自己说了「两个汉堡」就严格照做，不擅自加量。
+    if parsed.get("mainElastic") and buy_main:
+        main_counts = [buy_main + i for i in range(0, 3)]
+    else:
+        main_counts = [buy_main]
+    main_groups: list[list[dict]] = []
+    for k in main_counts:
+        # 每个份数各自限量，避免 4 个的笛卡尔积把 2、3 个的候选挤出上限
+        main_groups.extend(_combo_pool(mains, k, max_out=200))
+
     drink_groups = _combo_pool(drinks, buy_drink)
     side_groups = _combo_pool(sides, n_side) if n_side else [[]]
 
@@ -713,7 +767,7 @@ def generate(
     }
 
 
-def _combo_pool(pool: list[dict], n: int) -> list[list[dict]]:
+def _combo_pool(pool: list[dict], n: int, max_out: int = MAX_CANDIDATES) -> list[list[dict]]:
     """按份数取组合：n=0 → 空；n=1 → 每个单品；n≥2 → 可重复组合（同款 ×2 也算）。"""
     if n <= 0:
         return [[]]
@@ -722,7 +776,7 @@ def _combo_pool(pool: list[dict], n: int) -> list[list[dict]]:
     out = []
     for combo in itertools.combinations_with_replacement(pool, n):
         out.append(list(combo))
-        if len(out) >= MAX_CANDIDATES:
+        if len(out) >= max_out:
             break
     return out
 
@@ -764,6 +818,17 @@ def _trial_order(candidates: list[dict], limit: int) -> list[dict]:
             return
         seen.add(sig)
         out.append(c)
+
+    # 0) 先按「总件数」分组，每组取列表价最低的一个：让「2 个汉堡」「3 个」「4 个」
+    #    都有机会被试算。份数没有弹性时这里只有一组，等于不做额外挑选。
+    by_count: dict[int, list[dict]] = {}
+    for c in candidates:
+        n_items = c.get("count") or sum(int(r.get("quantity") or 1) for r in c["rows"])
+        by_count.setdefault(n_items, []).append(c)
+    for k in sorted(by_count):
+        if len(out) >= limit:
+            break
+        take(min(by_count[k], key=lambda c: (c["rawPrice"], c["rawKcal"])))
 
     # 1) 每种主餐各占 1 个名额，按该主餐最便宜的列表价升序
     for key in sorted(groups, key=lambda k: (groups[k][0]["rawPrice"], groups[k][0]["rawKcal"])):

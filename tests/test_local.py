@@ -277,6 +277,52 @@ class TestLLMParsing(unittest.TestCase):
         self.assertEqual(merged["counts"]["main"], 2)
         self.assertEqual(merged["counts"]["drink"], 1)
 
+    def test_per_person_kcal_scaled_by_people(self):
+        """「每个人不超过1000千卡」是人均上限，全单要乘人数。"""
+        parsed = self.planner.parse_request("每个人不超过1000千卡，两个人，不要咖啡", self.items, "lean")
+        self.assertTrue(parsed["kcalLimit"]["perPerson"])
+        merged, _ = self.planner.merge_llm(
+            parsed, self.llm.normalize({"people": 2, "kcalMax": 1000, "kcalScope": "perPerson"}), self.items
+        )
+        self.assertEqual(merged["kcalLimit"]["value"], 2000)
+        self.assertFalse(merged["kcalLimit"]["perPerson"])
+
+    def test_per_person_without_people_keeps_single(self):
+        """只说「每人1000千卡」但没说人数时，按单份上限算并给出提示。"""
+        parsed = self.planner.parse_request("每人不超过1000千卡", self.items, "lean")
+        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({}), self.items)
+        self.assertEqual(merged["kcalLimit"]["value"], 1000)
+        self.assertTrue(any("每人" in u for u in merged.get("unresolved") or []))
+
+    def test_people_allows_more_than_one_main_each(self):
+        """两个人时允许配 3~4 个汉堡：人均 1 个常常不够吃。"""
+        parsed = self.planner.parse_request("两个人，不要咖啡", self.items, "lean")
+        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({"people": 2}), self.items)
+        self.assertTrue(merged.get("mainElastic"))
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        self.assertTrue(gen["plans"])
+        counts = {c["count"] for c in gen["plans"]}
+        self.assertTrue(any(n >= 3 for n in counts), f"没有多于 2 件的方案：{counts}")
+
+    def test_explicit_counts_do_not_float(self):
+        """用户自己说了「两个汉堡」就严格两个，不自动加量。"""
+        parsed = self.planner.parse_request("两个汉堡，不要咖啡", self.items, "lean")
+        merged, _ = self.planner.merge_llm(parsed, self.llm.normalize({"people": 3}), self.items)
+        self.assertFalse(merged.get("mainElastic"))
+        gen = self.planner.generate(self.items, merged, mode="lean")
+        self.assertTrue(gen["plans"])
+        self.assertTrue(all(c["count"] == 2 for c in gen["plans"]))
+
+    def test_trial_order_covers_different_item_counts(self):
+        """试算取样要覆盖不同件数，否则 3、4 个汉堡的方案永远轮不到展示。"""
+        cand = lambda codes: {"rows": [{"code": c, "name": c, "quantity": 1, "kind": "burger"} for c in codes]}
+        candidates = [cand(["A"]), cand(["A", "B"]), cand(["A", "B", "C"]), cand(["A", "B", "C", "D"])]
+        for c in candidates:
+            c["rawPrice"] = 10 * len(c["rows"])
+            c["rawKcal"] = 100 * len(c["rows"])
+        picked = self.planner._trial_order(candidates, 4)
+        self.assertEqual({len(c["rows"]) for c in picked}, {1, 2, 3, 4})
+
     def test_prefer_keyword_changes_order_not_filter(self):
         parsed = self.planner.parse_request("想吃鱼", self.items, "lean")
         merged, _ = self.planner.merge_llm(
