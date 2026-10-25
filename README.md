@@ -1,4 +1,4 @@
-# 麦当劳点餐助手（Skill + H5）
+# 麦当劳点餐助手（网站与服务）
 
 按 `docs/prd/PRD-001.md`（V1.21）实现。手机优先的 H5 + 共享业务层，业务口径全部来自 PRD 的 §1.4。
 
@@ -20,11 +20,15 @@ tests/                 # 离线测试 + 真实只读冒烟
 docs/                  # PRD 与需求记录
 ```
 
-配餐 Skill 包（`.workbuddy/skills/mcd-meal-planner/`）已拆分为**独立仓库** `mcd-meal-planner`，不在本仓库内维护，避免两份口径漂移。
+配餐 Skill 包（`.workbuddy/skills/mcd-meal-planner/`）已拆分为**独立仓库** [mcd-meal-planner](https://github.com/chaoyuebro/mcd-meal-planner)，不在本仓库内维护，避免两份口径漂移。
 
 ## Skill 包
 
-配餐 Skill 包在独立仓库 `mcd-meal-planner`（本地仍位于 `.workbuddy/skills/mcd-meal-planner/`，项目级生效）。
+配餐 Skill 包在独立仓库 [mcd-meal-planner](https://github.com/chaoyuebro/mcd-meal-planner)（本地仍位于 `.workbuddy/skills/mcd-meal-planner/`，项目级生效）。克隆网站仓库不会包含 Skill，需单独安装：
+
+```bash
+git clone https://github.com/chaoyuebro/mcd-meal-planner.git .workbuddy/skills/mcd-meal-planner
+```
 
 ```
 SKILL.md              # 触发条件、工作流、硬约束（不得编造数字、不得放宽条件）
